@@ -41,7 +41,7 @@ TradingView V25 (alert() JSON) ─HTTPS─► Caddy (TLS) ─► FastAPI engine 
 | `v25bot/` | Execution engine (FastAPI). |
 | `v25bot/brokers/paper.py` | Paper broker simulator. |
 | `v25bot/brokers/tradovate.py` | Tradovate adapter: documented API only, **disabled**, unverified against real servers. |
-| `tests/` | 183 automated tests, including an end-to-end HTTP drill. |
+| `tests/` | 194 automated tests, including an end-to-end HTTP drill and deployment-config checks. |
 | `v25_paper_bot/` | The original prototype from `v25_paper_bot.zip`, kept unchanged for reference. Its routes and payload still work through the new engine. |
 | `docs/` | Implementation plan, Pine change log, Tradovate/Lucid findings. |
 
@@ -87,10 +87,11 @@ python -m pytest -q
 
 TradingView requirements (check your plan's current terms): webhook alerts need a **paid plan** and **two-factor authentication** enabled on the account. Webhooks are sent only to ports **80/443**, must be answered within about **3 seconds**, and come from these IPs: `52.89.214.238`, `34.212.75.30`, `54.218.53.128`, `52.32.178.7`.
 
-**1. Deploy the engine on a public HTTPS domain.** Follow [Docker deployment](#docker-deployment-with-https). Confirm from your own machine:
+**1. Make the engine reachable over public HTTPS.** Follow [Docker deployment](#docker-deployment-with-https): a Cloudflare Tunnel on Windows (option A) or your own domain with Caddy (option B). Confirm:
 ```bash
-curl https://YOUR_DOMAIN/health        # {"status":"ok","mode":"PAPER_ONLY",...}
+curl https://YOUR_PUBLIC_HOST/health   # {"status":"ok","mode":"PAPER_ONLY",...}
 ```
+`YOUR_PUBLIC_HOST` is the `https://….trycloudflare.com` address cloudflared prints (option A) or your domain (option B).
 
 **2. Add the webhook script.** In TradingView open **Pine Editor → New → Strategy**, paste the whole of `pine/V25_webhook.pine`, **Save**, then **Add to chart**.
 
@@ -112,9 +113,9 @@ curl https://YOUR_DOMAIN/health        # {"status":"ok","mode":"PAPER_ONLY",...}
 * **Message:** leave as is. It is ignored, because the script writes the JSON.
 * **Notifications → Webhook URL:**
   ```
-  https://YOUR_DOMAIN/webhook/tradingview/YOUR_WEBHOOK_TOKEN
+  https://YOUR_PUBLIC_HOST/webhook/tradingview/YOUR_WEBHOOK_TOKEN
   ```
-  (`YOUR_WEBHOOK_TOKEN` = contents of `secrets/webhook_token`). Treat this URL as a password.
+  (`YOUR_WEBHOOK_TOKEN` = contents of `secrets/webhook_token`). Treat this URL as a password. A quick tunnel gets a **new** trycloudflare address each time cloudflared starts, so update the alert's webhook URL whenever it changes.
 * **Create.**
 
 > TradingView alerts snapshot the script and inputs at creation time. **Whenever you change inputs or the script, delete and recreate the alert.**
@@ -132,24 +133,47 @@ Entries are accepted only 08:30–14:30 New York time on weekdays, and positions
 
 ## Docker deployment with HTTPS
 
-Requires Docker with Compose, a host with ports 80/443 open, and a DNS `A` record for your domain pointing at it.
+Common setup (Docker Desktop on Windows, or any Docker host):
 
 ```bash
-cp .env.example .env                  # edit DOMAIN, limits, ALERT_WEBHOOK_URL
+cp .env.example .env                  # edit limits, ALERT_WEBHOOK_URL
 mkdir -p secrets && chmod 700 secrets
 python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > secrets/webhook_token
 python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > secrets/admin_token
 chmod 600 secrets/*
-docker compose up -d --build
+```
+
+### Option A (default): Windows PC + Cloudflare Tunnel
+
+```bash
+docker compose up -d --build          # starts only the engine
+curl http://127.0.0.1:8000/health     # from the same PC
+cloudflared tunnel --url http://localhost:8000
+```
+
+* The engine is published as `127.0.0.1:8000:8000`, so only this PC can reach it: not your LAN, not the internet. **Do not** change it to `8000:8000`, which listens on every network interface.
+* cloudflared provides the public HTTPS address (`https://….trycloudflare.com`) that TradingView calls on port 443. Caddy isn't used, so there's no HTTP→HTTPS redirect in the path.
+* The IP allowlist still works. Cloudflare appends the real sender (TradingView) to `X-Forwarded-For`, and compose trusts only the hops that can reach the port: host loopback, Docker bridge gateways, and Docker Desktop's forwarder (`192.168.65.0/24`). Forged `X-Forwarded-For` values are ignored because the right-most untrusted hop is used.
+* A quick tunnel forwards **every** path to the engine. `/status`, `/admin/*` and `/docs` are therefore reachable through the trycloudflare address, protected only by the admin bearer token. Keep `secrets/admin_token` long and private. For path-level filtering, use a named Cloudflare Tunnel with ingress rules that allow only `/webhook/*` and `/health`, or option B.
+* Quick tunnels are meant for testing. Cloudflare gives no uptime guarantee, and the address changes on every restart.
+
+### Option B: public domain with Caddy (ports 80/443)
+
+Requires ports 80/443 open to the internet and a DNS `A` record for `DOMAIN`.
+
+```bash
+# set DOMAIN in .env first
+docker compose --profile caddy up -d --build
 docker compose logs -f
 ```
 
 * **Caddy** obtains and renews the TLS certificate automatically, exposes only `/webhook/*` and `/health`, and removes URIs (which contain the token) from its access log.
-* The admin API is **not** exposed publicly. Use `docker compose exec engine python -m v25bot.admin …`.
-* Compose **forces** `PAPER_ONLY=true`, `BROKER=paper`, `TRADOVATE_ENABLED=false`, `LIVE_TRADING_ENABLED=false`, overriding `.env`.
-* State (SQLite: events, orders, fills, halts, paper account) lives in the `engine-data` volume and survives restarts.
 
-The Docker image and compose stack were written but **not built or run in the development sandbox** (no Docker daemon was available there). Run `docker compose config` and a first `docker compose up` yourself and check `/health`.
+### Both options
+
+* The admin API is meant for local use: `docker compose exec engine python -m v25bot.admin …`.
+* Compose **forces** `PAPER_ONLY=true`, `BROKER=paper`, `TRADOVATE_ENABLED=false`, `LIVE_TRADING_ENABLED=false`, overriding `.env`. `/health` reports `"live_enabled": false`.
+* State (SQLite: events, orders, fills, halts, paper account) lives in the `engine-data` volume and survives restarts.
 
 ---
 
@@ -264,6 +288,7 @@ python -m pytest -q
 | `test_safety_and_tradovate.py` | PAPER_ONLY gates, prop-account refusal, live gates, secret files and redaction, Tradovate request shapes, CAPTCHA refusal |
 | `test_pine.py` | Webhook script only adds lines; trading calls unchanged; emitted JSON keys match the schema |
 | `test_e2e_http.py` | Real uvicorn server + monitor: entry → duplicate → target → stop gap → trade limit → 14:30 cutoff → kill/resume → outage/reconnect |
+| `test_deploy_config.py` | `docker-compose.yml`: loopback-only port, forced paper mode, opt-in Caddy; IP allowlist through a Cloudflare Tunnel on Docker Desktop, including forged `X-Forwarded-For` |
 
 ---
 

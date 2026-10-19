@@ -1,5 +1,11 @@
-# Paper trading deployment: engine + Caddy (automatic HTTPS via Let's Encrypt).
-# TradingView webhooks only reach ports 80/443, so Caddy terminates TLS on 443.
+# Paper trading deployment.
+#
+# Default (Windows / Cloudflare Tunnel):  docker compose up -d --build
+#   The engine listens on http://127.0.0.1:8000 on this PC only; the tunnel
+#   (cloudflared tunnel --url http://localhost:8000) provides public HTTPS.
+#
+# Optional public-domain mode with Caddy + Let's Encrypt on ports 80/443:
+#   set DOMAIN in .env, then: docker compose --profile caddy up -d --build
 services:
   engine:
     build: .
@@ -11,23 +17,31 @@ services:
       BROKER: "paper"
       TRADOVATE_ENABLED: "false"
       LIVE_TRADING_ENABLED: "false"
+      # Only proxies on this PC/Docker can reach the engine (see ports below), so
+      # their X-Forwarded-For is honoured; the right-most untrusted hop is the client.
+      #   127.0.0.0/8     host loopback (cloudflared)
+      #   172.16.0.0/12   Docker bridge gateways and the Caddy container
+      #   192.168.65.0/24 Docker Desktop's VM forwarder for published ports
       TRUST_PROXY_HEADERS: "true"
-      TRUSTED_PROXIES: "172.16.0.0/12"
+      TRUSTED_PROXIES: "127.0.0.0/8,172.16.0.0/12,192.168.65.0/24"
       WEBHOOK_TOKEN_FILE: /run/secrets/webhook_token
       ADMIN_TOKEN_FILE: /run/secrets/admin_token
     secrets: [webhook_token, admin_token]
     volumes:
       - engine-data:/data
-    expose: ["8000"]
+    # Loopback only: reachable from this PC, not from the LAN or internet.
+    # Never change this to "8000:8000", which listens on every interface.
+    ports: ["127.0.0.1:8000:8000"]
     networks: [internal]
 
   caddy:
     image: caddy:2.8.4
+    profiles: ["caddy"]
     restart: unless-stopped
     depends_on: [engine]
     ports: ["80:80", "443:443"]
     environment:
-      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+      DOMAIN: ${DOMAIN:-}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
