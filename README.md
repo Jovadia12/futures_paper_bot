@@ -17,6 +17,8 @@ TradingView V25 (alert() JSON) ─HTTPS─► Caddy (TLS) ─► FastAPI engine 
 
 ---
 
+> **Dashboard:** http://127.0.0.1:8080 on the bot PC, and privately on your iPhone/MacBook through Tailscale. Setup: [docs/DASHBOARD.md](docs/DASHBOARD.md).
+
 ## Contents
 
 1. [Repository layout](#repository-layout)
@@ -41,7 +43,8 @@ TradingView V25 (alert() JSON) ─HTTPS─► Caddy (TLS) ─► FastAPI engine 
 | `v25bot/` | Execution engine (FastAPI). |
 | `v25bot/brokers/paper.py` | Paper broker simulator. |
 | `v25bot/brokers/tradovate.py` | Tradovate adapter: documented API only, **disabled**, unverified against real servers. |
-| `tests/` | 194 automated tests, including an end-to-end HTTP drill and deployment-config checks. |
+| `v25bot/dashboard/` | Read-only monitoring dashboard (separate service on `127.0.0.1:8080`). See [docs/DASHBOARD.md](docs/DASHBOARD.md). |
+| `tests/` | Automated tests, including an end-to-end HTTP drill, dashboard accuracy and security tests, and deployment-config checks. |
 | `v25_paper_bot/` | The original prototype from `v25_paper_bot.zip`, kept unchanged for reference. Its routes and payload still work through the new engine. |
 | `docs/` | Implementation plan, Pine change log, Tradovate/Lucid findings. |
 
@@ -192,6 +195,10 @@ docker compose logs -f
 
 **Alerts** go to the JSON log, the `audit` table, and optionally `ALERT_WEBHOOK_URL` (Slack, Discord, or generic JSON). Critical alerts include: unprotected position, flatten failed (manual intervention required), kill switch, and drawdown halt. Warnings include: rejected entries, broker disconnect/reconnect, stale prices with an open position, TradingView silence (`TV_HEARTBEAT_MAX_AGE_SECONDS`), and contract-roll notices.
 
+### Dashboard
+
+A separate, read-only monitoring website: `docker compose up -d --build --no-deps dashboard`, then open http://127.0.0.1:8080. It is password-protected, never exposed through the Cloudflare tunnel, and reachable from your phone and laptop only through Tailscale. Full guide: [docs/DASHBOARD.md](docs/DASHBOARD.md).
+
 ---
 
 ## How it works
@@ -288,7 +295,9 @@ python -m pytest -q
 | `test_safety_and_tradovate.py` | PAPER_ONLY gates, prop-account refusal, live gates, secret files and redaction, Tradovate request shapes, CAPTCHA refusal |
 | `test_pine.py` | Webhook script only adds lines; trading calls unchanged; emitted JSON keys match the schema |
 | `test_e2e_http.py` | Real uvicorn server + monitor: entry → duplicate → target → stop gap → trade limit → 14:30 cutoff → kill/resume → outage/reconnect |
-| `test_deploy_config.py` | `docker-compose.yml`: loopback-only port, forced paper mode, opt-in Caddy; IP allowlist through a Cloudflare Tunnel on Docker Desktop, including forged `X-Forwarded-For` |
+| `test_deploy_config.py` | `docker-compose.yml`: loopback-only port, forced paper mode, opt-in Caddy, dashboard isolation and hardening; IP allowlist through a Cloudflare Tunnel on Docker Desktop, including forged `X-Forwarded-For` |
+| `test_dashboard_analytics.py` | Trade reconstruction from fills (partials, flips, flatten reasons), statistics, drawdown, ranges in ET, activity classification, CME hours |
+| `test_dashboard_api.py` | Dashboard against the real engine: figures equal broker state, no fabricated metrics, engine-offline handling, login/lockout/cookies, host allowlist, cross-origin, read-only enforcement, CSP, CSV |
 
 ---
 

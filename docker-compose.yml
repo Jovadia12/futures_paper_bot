@@ -4,6 +4,8 @@
 #   The engine listens on http://127.0.0.1:8000 on this PC only; the tunnel
 #   (cloudflared tunnel --url http://localhost:8000) provides public HTTPS.
 #
+# Dashboard (read-only): http://127.0.0.1:8080 — see README "Dashboard".
+#
 # Optional public-domain mode with Caddy + Let's Encrypt on ports 80/443:
 #   set DOMAIN in .env, then: docker compose --profile caddy up -d --build
 services:
@@ -34,6 +36,49 @@ services:
     ports: ["127.0.0.1:8000:8000"]
     networks: [internal]
 
+  # Read-only monitoring dashboard: http://127.0.0.1:8080 on this PC.
+  # Remote access is via Tailscale Serve on the host (tailnet-only), never the
+  # public Cloudflare tunnel. It reads the engine's API with GET requests only.
+  dashboard:
+    build: .
+    command: ["python", "-m", "v25bot.dashboard"]
+    restart: unless-stopped
+    depends_on: [engine]
+    env_file: .env
+    environment:
+      ENGINE_URL: http://engine:8000
+      DASHBOARD_HOST: 0.0.0.0
+      DASHBOARD_PORT: "8080"
+      DASHBOARD_IN_DOCKER: "true"
+      ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      DASHBOARD_PASSWORD_FILE: /run/secrets/dashboard_password
+      # Same safety values as the engine (used only to display risk limits).
+      PAPER_ONLY: "true"
+      BROKER: "paper"
+      TRADOVATE_ENABLED: "false"
+      LIVE_TRADING_ENABLED: "false"
+      # The dashboard never needs these; blank any copies that live in .env.
+      WEBHOOK_TOKEN: ""
+      WEBHOOK_PASSPHRASE: ""
+      ALERT_WEBHOOK_URL: ""
+      TRADOVATE_USERNAME: ""
+      TRADOVATE_PASSWORD: ""
+      TRADOVATE_CID: ""
+      TRADOVATE_SECRET: ""
+    secrets: [admin_token, dashboard_password]
+    # Loopback only. Never "8080:8080".
+    ports: ["127.0.0.1:8080:8080"]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [internal]
+
   caddy:
     image: caddy:2.8.4
     profiles: ["caddy"]
@@ -53,6 +98,8 @@ secrets:
     file: ./secrets/webhook_token
   admin_token:
     file: ./secrets/admin_token
+  dashboard_password:
+    file: ./secrets/dashboard_password
 
 volumes:
   engine-data:

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0d13">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="V25">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Sign in · V25</title>
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/icon-180.png">
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="login-wrap">
+    <form class="card login-card" id="login" autocomplete="on">
+      <div class="brand-mark">V25</div>
+      <h1>V25 Monitor</h1>
+      <p>Read-only paper-trading dashboard. Sign in to continue.</p>
+      <label for="password">Dashboard password</label>
+      <input class="input" id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+      <button class="btn btn-primary" type="submit" id="submit">Sign in</button>
+      <div class="login-error" id="error" role="alert"></div>
+      <div class="login-foot">PAPER ONLY · monitoring cannot place, change or cancel orders</div>
+    </form>
+  </main>
+  <script type="module" src="/static/login.js"></script>
+</body>
+</html>

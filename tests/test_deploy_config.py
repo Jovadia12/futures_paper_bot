@@ -108,3 +108,32 @@ def test_bad_token_rejected_through_tunnel(tunnel):
 def test_health_reachable_through_tunnel(tunnel):
     body = tunnel("192.168.65.1").get("/health").json()
     assert body["status"] == "ok" and body["paper_only"] is True and body["live_enabled"] is False
+
+
+# ----------------------------------------------------------------------------- dashboard service
+DASHBOARD = _service("dashboard")
+
+
+def test_dashboard_published_on_loopback_only():
+    ports = re.findall(r"^\s+ports: \[(.*)\]$", DASHBOARD, re.M)
+    assert ports == ['"127.0.0.1:8080:8080"']
+
+
+def test_dashboard_has_no_docker_api_or_engine_data_access():
+    assert "docker.sock" not in COMPOSE
+    assert "volumes:" not in DASHBOARD and "engine-data" not in DASHBOARD
+    assert "secrets: [admin_token, dashboard_password]" in DASHBOARD
+    assert "webhook_token" not in DASHBOARD.split("secrets:")[1]
+
+
+def test_dashboard_container_hardened_and_paper_only():
+    assert "read_only: true" in DASHBOARD and "cap_drop: [ALL]" in DASHBOARD
+    assert "no-new-privileges:true" in DASHBOARD
+    assert _env(DASHBOARD, "PAPER_ONLY") == "true" and _env(DASHBOARD, "LIVE_TRADING_ENABLED") == "false"
+    assert _env(DASHBOARD, "WEBHOOK_TOKEN") == ""  # a copy in .env never reaches the dashboard
+    assert _env(DASHBOARD, "ENGINE_URL") == "http://engine:8000"
+
+
+def test_engine_service_untouched_by_dashboard():
+    assert "dashboard" not in ENGINE
+    assert re.findall(r"^\s+ports: \[(.*)\]$", ENGINE, re.M) == ['"127.0.0.1:8000:8000"']
