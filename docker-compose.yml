@@ -1,0 +1,49 @@
+# Paper trading deployment: engine + Caddy (automatic HTTPS via Let's Encrypt).
+# TradingView webhooks only reach ports 80/443, so Caddy terminates TLS on 443.
+services:
+  engine:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Hard safety defaults; .env cannot silently remove them because these win.
+      PAPER_ONLY: "true"
+      BROKER: "paper"
+      TRADOVATE_ENABLED: "false"
+      LIVE_TRADING_ENABLED: "false"
+      TRUST_PROXY_HEADERS: "true"
+      TRUSTED_PROXIES: "172.16.0.0/12"
+      WEBHOOK_TOKEN_FILE: /run/secrets/webhook_token
+      ADMIN_TOKEN_FILE: /run/secrets/admin_token
+    secrets: [webhook_token, admin_token]
+    volumes:
+      - engine-data:/data
+    expose: ["8000"]
+    networks: [internal]
+
+  caddy:
+    image: caddy:2.8.4
+    restart: unless-stopped
+    depends_on: [engine]
+    ports: ["80:80", "443:443"]
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [internal]
+
+secrets:
+  webhook_token:
+    file: ./secrets/webhook_token
+  admin_token:
+    file: ./secrets/admin_token
+
+volumes:
+  engine-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  internal:

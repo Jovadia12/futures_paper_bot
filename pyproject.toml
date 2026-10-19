@@ -1,0 +1,10 @@
+[project]
+name = "v25bot"
+version = "1.0.0"
+description = "V25 TradingView strategy execution engine (paper-first)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning", "ignore:Using `httpx` with `starlette.testclient`"]

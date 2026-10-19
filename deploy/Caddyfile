@@ -1,0 +1,31 @@
+{$DOMAIN} {
+	encode gzip
+
+	# TradingView webhook ingress.
+	handle /webhook/* {
+		request_body {
+			max_size 8KB
+		}
+		reverse_proxy engine:8000
+	}
+
+	# Health is public; everything else (admin, status, docs) stays internal.
+	handle /health {
+		reverse_proxy engine:8000
+	}
+
+	handle {
+		respond 404
+	}
+
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri delete
+				request>headers>Authorization delete
+			}
+		}
+	}
+}

@@ -1,0 +1,978 @@
+//@version=6
+// V25 + webhook automation (V25-webhook.1)
+// Strategy logic is byte-for-byte the original V25. Only additive alert()
+// calls and the inputs in group "9. Webhook Automation" were added.
+// See docs/PINE_CHANGES.md for the full list of changes.
+strategy("ICT FVG V25 | V22 Core + Sweep Test + Prop Mode",
+     overlay=true,
+     initial_capital=50000,
+     currency=currency.USD,
+     pyramiding=0,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=1.50,
+     slippage=2,
+     process_orders_on_close=false,
+     calc_on_order_fills=false,
+     margin_long=10,
+     margin_short=10,
+     max_labels_count=300)
+
+// ============================================================
+// 1. SESSION
+// ============================================================
+
+gSession = "1. Session"
+
+tradeSession = input.session("0830-1430", "Entry window NY", group=gSession)
+flatHour = input.int(14, "Flatten hour NY", minval=0, maxval=23, group=gSession)
+flatMinute = input.int(30, "Flatten minute NY", minval=0, maxval=59, group=gSession)
+maxTrades = input.int(2, "Maximum trades per day", minval=1, maxval=10, group=gSession)
+
+// ============================================================
+// 2. HIGHER-TIMEFRAME FVG
+// ============================================================
+
+gHTF = "2. HTF Fair Value Gaps"
+
+use15 = input.bool(true, "Use 15m FVG", group=gHTF)
+use60 = input.bool(true, "Use 1h FVG", group=gHTF)
+minHTFTicks = input.int(4, "Minimum HTF FVG ticks", minval=1, group=gHTF)
+zoneAgeHours = input.int(96, "Maximum zone age hours", minval=1, group=gHTF)
+requireTrend = input.bool(true, "Use 1h EMA trend", group=gHTF)
+emaLength = input.int(50, "1h EMA length", minval=5, group=gHTF)
+
+// ============================================================
+// 3. ENTRY QUALITY
+// ============================================================
+
+gEntry = "3. IFVG Entry"
+
+findGapBars = input.int(15, "Bars to find opposing FVG", minval=1, group=gEntry)
+invertBars = input.int(12, "Bars allowed for inversion", minval=1, group=gEntry)
+minGapTicks = input.int(2, "Minimum 1m FVG ticks", minval=1, group=gEntry)
+bodyATR = input.float(0.35, "Inversion body / ATR", minval=0.05, step=0.05, group=gEntry)
+structureBars = input.int(3, "Structure break lookback", minval=1, group=gEntry)
+maxStopATR = input.float(10.0, "Maximum stop distance / ATR", minval=1, group=gEntry)
+
+gSweep = "4. Experimental Sweep Filter"
+
+requireSweep = input.bool(true, "Require liquidity sweep before entry", group=gSweep)
+sweepLookback = input.int(30, "Maximum bars since sweep", minval=1, group=gSweep)
+
+// ============================================================
+// 5. CONTRACT SIZING
+// ============================================================
+
+gSize = "5. Position Sizing"
+
+sizingMode = input.string(
+     "V22 Baseline",
+     "Sizing mode",
+     options=["V22 Baseline", "Prop Conservative"],
+     group=gSize)
+
+minContracts = input.int(5, "V22 baseline minimum contracts", minval=1, group=gSize)
+maxContracts = input.int(7, "Maximum contracts", minval=1, group=gSize)
+
+baselineRiskPct = input.float(2.0, "V22 equity risk %", minval=0.1, step=0.25, group=gSize)
+baselineRiskCap = input.float(1500, "V22 maximum planned risk USD", minval=10, group=gSize)
+
+propRiskTarget = input.float(250, "Prop target planned risk USD", minval=10, group=gSize)
+propRiskCap = input.float(300, "Prop maximum planned risk USD", minval=10, group=gSize)
+
+stopBufferTicks = input.int(2, "Ticks beyond third-candle extreme", minval=0, group=gSize)
+entryReserveTicks = input.int(4, "Prop entry fill reserve ticks", minval=0, group=gSize)
+costReserve = input.float(8.0, "Estimated round-trip cost per contract USD", minval=0, group=gSize)
+
+// ============================================================
+// 6. LIQUIDITY TARGETS
+// ============================================================
+
+gLiquidity = "6. Resting Liquidity"
+
+minRR = input.float(2.0, "Minimum estimated R:R", minval=1, step=0.25, group=gLiquidity)
+maxRR = input.float(12.0, "Maximum liquidity target R:R", minval=2, step=0.5, group=gLiquidity)
+pivotLength = input.int(5, "Confirmed liquidity pivot bars", minval=2, group=gLiquidity)
+maxLevels = input.int(80, "Stored liquidity levels", minval=10, maxval=200, group=gLiquidity)
+
+// ============================================================
+// 7. SIMULATED PROP ACCOUNT
+// Applied only in Prop Conservative mode.
+// ============================================================
+
+gProp = "7. Prop Simulation"
+
+accountStart = input.float(50000, "Account starting balance", minval=1000, group=gProp)
+maxLossAllowance = input.float(2000, "Maximum loss allowance USD", minval=100, group=gProp)
+dailyLossCap = input.float(450, "Internal daily loss cap USD", minval=50, group=gProp)
+safetyBuffer = input.float(400, "Safety reserve above loss floor USD", minval=0, group=gProp)
+roomRiskFraction = input.float(0.20, "Maximum remaining room risk fraction", minval=0.05, maxval=1, step=0.05, group=gProp)
+
+// ============================================================
+// 8. DISPLAY
+// ============================================================
+
+gVisual = "8. Display"
+
+showZones = input.bool(true, "Show HTF FVG zones", group=gVisual)
+showFVG = input.bool(true, "Show opposing FVG", group=gVisual)
+showStops = input.bool(true, "Show structural stop and liquidity target", group=gVisual)
+showLabels = input.bool(true, "Show trade labels", group=gVisual)
+showDashboard = input.bool(true, "Show diagnostics", group=gVisual)
+
+// ============================================================
+// 9. WEBHOOK AUTOMATION (ADDED: alert output only)
+// ============================================================
+
+gHook = "9. Webhook Automation"
+
+enableWebhook = input.bool(true, "Emit webhook alert() JSON", group=gHook)
+botId = input.string("V25-MNQ-1", "Bot id (letters, digits, - and _ only)", group=gHook)
+hookPassphrase = input.string("", "Optional body passphrase (blank = rely on URL token)", group=gHook)
+emitBars = input.bool(true, "Emit 1m bar prices (paper fill simulation)", group=gHook)
+emitExits = input.bool(true, "Emit TradingView exit / flatten events", group=gHook)
+
+STRATEGY_VERSION = "V25-webhook.1"
+
+// ============================================================
+// CORE VARIABLES
+// ============================================================
+
+tz = "America/New_York"
+
+tick = syminfo.mintick
+pointValue = syminfo.pointvalue
+atr = ta.atr(14)
+
+propMode = sizingMode == "Prop Conservative"
+validChart = timeframe.isminutes and timeframe.multiplier == 1
+
+inSession = not na(time(timeframe.period, tradeSession, tz))
+
+nyHour = hour(time, tz)
+nyMinute = minute(time, tz)
+
+afterFlat = nyHour > flatHour or (nyHour == flatHour and nyMinute >= flatMinute)
+
+dayKey = year(time, tz) * 10000 + month(time, tz) * 100 + dayofmonth(time, tz)
+
+newDay = not na(dayKey[1]) and dayKey != dayKey[1]
+
+// ============================================================
+// WEBHOOK JSON HELPERS (ADDED)
+// ============================================================
+
+f_num(float x) =>
+    na(x) ? "null" : str.tostring(x, format.mintick)
+
+f_eid(string kind) =>
+    "V25-" + botId + "-" + str.tostring(time) + "-" + kind
+
+f_base(string evt, string eid) =>
+    string chartContract = syminfo.current_contract
+    "{" +
+     "\"schema\":\"v25.webhook.v1\"," +
+     "\"strategy\":\"V25\"," +
+     "\"strategy_version\":\"" + STRATEGY_VERSION + "\"," +
+     "\"bot_id\":\"" + botId + "\"," +
+     "\"event\":\"" + evt + "\"," +
+     "\"event_id\":\"" + eid + "\"," +
+     "\"symbol\":\"" + syminfo.prefix + ":" + syminfo.ticker + "\"," +
+     "\"contract\":" + (na(chartContract) or chartContract == "" ? "null" : "\"" + chartContract + "\"") + "," +
+     "\"timeframe\":\"" + timeframe.period + "\"," +
+     "\"bar_time\":" + str.tostring(time) + "," +
+     "\"sent_at\":" + str.tostring(timenow) + "," +
+     "\"passphrase\":\"" + hookPassphrase + "\""
+
+// ============================================================
+// APPROXIMATE PROP RISK TRACKING
+// ============================================================
+
+var float dayStartEquity = na
+var float peakEodEquity = na
+var float trailingFloor = na
+
+var bool dailyHalt = false
+var bool accountHalt = false
+
+var int tradesToday = 0
+
+if barstate.isfirst
+    dayStartEquity := strategy.equity
+    peakEodEquity := accountStart
+    trailingFloor := accountStart - maxLossAllowance
+
+if newDay
+    // Previous NY day's final sampled equity.
+    priorEod = strategy.equity[1]
+
+    peakEodEquity := math.max(peakEodEquity, priorEod)
+
+    // Approximate trailing drawdown, capped at start balance.
+    trailingFloor := math.min(
+         accountStart,
+         peakEodEquity - maxLossAllowance)
+
+    dayStartEquity := strategy.equity
+
+    tradesToday := 0
+    dailyHalt := false
+
+dailyPnL = strategy.equity - dayStartEquity
+drawdownRoom = strategy.equity - trailingFloor
+usableRoom = math.max(0.0, drawdownRoom - safetyBuffer)
+
+if propMode
+    if dailyPnL <= -dailyLossCap
+        dailyHalt := true
+
+    if drawdownRoom <= safetyBuffer
+        accountHalt := true
+
+if propMode and (dailyHalt or accountHalt)
+    strategy.cancel_all()
+
+    if strategy.position_size != 0
+        strategy.close_all(comment="Prop risk halt", immediately=true)
+
+        // ADDED: tell the execution engine to flatten.
+        if enableWebhook and emitExits
+            alert(f_base("flatten", f_eid("flatten-prop")) + ",\"reason\":\"prop_risk_halt\"}", alert.freq_once_per_bar_close)
+
+// ============================================================
+// CONFIRMED HTF FVG SERIES
+// ============================================================
+
+f_htf() =>
+    bull = low[1] > high[3]
+    bear = high[1] < low[3]
+
+    [
+         bull,
+         bear,
+         high[3],
+         low[1],
+         high[1],
+         low[3],
+         time[1]
+     ]
+
+[b15, s15, b15lo, b15hi, s15lo, s15hi, t15] = request.security(
+     syminfo.tickerid, "15", f_htf(),
+     lookahead=barmerge.lookahead_on)
+
+[b60, s60, b60lo, b60hi, s60lo, s60hi, t60] = request.security(
+     syminfo.tickerid, "60", f_htf(),
+     lookahead=barmerge.lookahead_on)
+
+ema60 = request.security(
+     syminfo.tickerid, "60",
+     ta.ema(close, emaLength)[1],
+     lookahead=barmerge.lookahead_on)
+
+close60 = request.security(
+     syminfo.tickerid, "60",
+     close[1],
+     lookahead=barmerge.lookahead_on)
+
+trendUp = not requireTrend or close60 > ema60
+trendDown = not requireTrend or close60 < ema60
+
+// ============================================================
+// HTF ZONE STORAGE
+// ============================================================
+
+var float bull15lo = na
+var float bull15hi = na
+var float bear15lo = na
+var float bear15hi = na
+
+var float bull60lo = na
+var float bull60hi = na
+var float bear60lo = na
+var float bear60hi = na
+
+var int bull15stamp = na
+var int bear15stamp = na
+var int bull60stamp = na
+var int bear60stamp = na
+
+var int last15 = na
+var int last60 = na
+
+if not na(t15) and (na(last15) or t15 != last15)
+    last15 := t15
+
+    if b15 and b15hi - b15lo >= minHTFTicks * tick
+        bull15lo := b15lo
+        bull15hi := b15hi
+        bull15stamp := t15
+
+    if s15 and s15hi - s15lo >= minHTFTicks * tick
+        bear15lo := s15lo
+        bear15hi := s15hi
+        bear15stamp := t15
+
+if not na(t60) and (na(last60) or t60 != last60)
+    last60 := t60
+
+    if b60 and b60hi - b60lo >= minHTFTicks * tick
+        bull60lo := b60lo
+        bull60hi := b60hi
+        bull60stamp := t60
+
+    if s60 and s60hi - s60lo >= minHTFTicks * tick
+        bear60lo := s60lo
+        bear60hi := s60hi
+        bear60stamp := t60
+
+maxAge = zoneAgeHours * 3600000
+
+if not na(bull15lo) and (close < bull15lo or time - bull15stamp > maxAge)
+    bull15lo := na
+    bull15hi := na
+
+if not na(bear15hi) and (close > bear15hi or time - bear15stamp > maxAge)
+    bear15lo := na
+    bear15hi := na
+
+if not na(bull60lo) and (close < bull60lo or time - bull60stamp > maxAge)
+    bull60lo := na
+    bull60hi := na
+
+if not na(bear60hi) and (close > bear60hi or time - bear60stamp > maxAge)
+    bear60lo := na
+    bear60hi := na
+
+// ============================================================
+// HTF ZONE DISPLAY
+// ============================================================
+
+p1 = plot(showZones and use15 ? bull15hi : na, "15m Bull High", color=color.new(color.teal, 35), style=plot.style_linebr)
+p2 = plot(showZones and use15 ? bull15lo : na, "15m Bull Low", color=color.new(color.teal, 35), style=plot.style_linebr)
+
+fill(p1, p2, color.new(color.teal, 90))
+
+p3 = plot(showZones and use15 ? bear15hi : na, "15m Bear High", color=color.new(color.red, 35), style=plot.style_linebr)
+p4 = plot(showZones and use15 ? bear15lo : na, "15m Bear Low", color=color.new(color.red, 35), style=plot.style_linebr)
+
+fill(p3, p4, color.new(color.red, 90))
+
+p5 = plot(showZones and use60 ? bull60hi : na, "1h Bull High", color=color.blue, style=plot.style_linebr)
+p6 = plot(showZones and use60 ? bull60lo : na, "1h Bull Low", color=color.blue, style=plot.style_linebr)
+
+fill(p5, p6, color.new(color.blue, 92))
+
+p7 = plot(showZones and use60 ? bear60hi : na, "1h Bear High", color=color.orange, style=plot.style_linebr)
+p8 = plot(showZones and use60 ? bear60lo : na, "1h Bear Low", color=color.orange, style=plot.style_linebr)
+
+fill(p7, p8, color.new(color.orange, 92))
+
+bullTap = (
+     use15 and not na(bull15lo) and low <= bull15hi and high >= bull15lo
+     ) or (
+     use60 and not na(bull60lo) and low <= bull60hi and high >= bull60lo
+     )
+
+bearTap = (
+     use15 and not na(bear15lo) and low <= bear15hi and high >= bear15lo
+     ) or (
+     use60 and not na(bear60lo) and low <= bear60hi and high >= bear60lo
+     )
+
+// ============================================================
+// CONFIRMED LIQUIDITY REGISTRY AND SWEEP DETECTION
+// ============================================================
+
+var array<float> highLevels = array.new_float()
+var array<float> lowLevels = array.new_float()
+
+var int lastSellsideSweep = na
+var int lastBuysideSweep = na
+
+ph = ta.pivothigh(high, pivotLength, pivotLength)
+pl = ta.pivotlow(low, pivotLength, pivotLength)
+
+// Look for a sweep + reclaim BEFORE removing the level.
+// Sell-side sweep: wick below confirmed low, close back above.
+// Buy-side sweep: wick above confirmed high, close back below.
+
+if array.size(highLevels) > 0
+    for i = array.size(highLevels) - 1 to 0
+        level = array.get(highLevels, i)
+
+        if high >= level
+            if high > level and close < level
+                lastBuysideSweep := bar_index
+
+            array.remove(highLevels, i)
+
+if array.size(lowLevels) > 0
+    for i = array.size(lowLevels) - 1 to 0
+        level = array.get(lowLevels, i)
+
+        if low <= level
+            if low < level and close > level
+                lastSellsideSweep := bar_index
+
+            array.remove(lowLevels, i)
+
+// Only add pivots confirmed using past and present data.
+if not na(ph) and high < ph
+    array.push(highLevels, ph)
+
+if not na(pl) and low > pl
+    array.push(lowLevels, pl)
+
+if array.size(highLevels) > maxLevels
+    array.shift(highLevels)
+
+if array.size(lowLevels) > maxLevels
+    array.shift(lowLevels)
+
+// ============================================================
+// PRIOR DAY HIGH / LOW
+// ============================================================
+
+pdh = request.security(
+     syminfo.tickerid, "D",
+     high[1],
+     lookahead=barmerge.lookahead_on)
+
+pdl = request.security(
+     syminfo.tickerid, "D",
+     low[1],
+     lookahead=barmerge.lookahead_on)
+
+var bool pdhTaken = false
+var bool pdlTaken = false
+
+if newDay
+    pdhTaken := false
+    pdlTaken := false
+
+if not na(pdh) and high >= pdh
+    pdhTaken := true
+
+if not na(pdl) and low <= pdl
+    pdlTaken := true
+
+// ============================================================
+// V22 SETUP STATE
+//
+// 0 waiting HTF tap
+// 1 waiting opposing FVG
+// 2 waiting IFVG inversion
+// 3 order submitted / position pending or active
+// ============================================================
+
+var int state = 0
+var int dir = 0
+
+var int tapBar = na
+var int gapBar = na
+var int submittedBar = na
+
+var float gapLo = na
+var float gapHi = na
+
+var float thirdLow = na
+var float thirdHigh = na
+
+var float tradeStop = na
+var float tradeTarget = na
+
+var int taps = 0
+var int gaps = 0
+var int inversions = 0
+var int sweepRejects = 0
+var int riskRejects = 0
+var int targetRejects = 0
+var int orders = 0
+
+allowedByProp = not propMode or (not dailyHalt and not accountHalt and usableRoom > 0)
+
+canTrade = (
+     validChart and
+     barstate.isconfirmed and
+     inSession and
+     not afterFlat and
+     allowedByProp and
+     strategy.position_size == 0 and
+     tradesToday < maxTrades
+     )
+
+if state != 3 and (not inSession or afterFlat or not allowedByProp)
+    state := 0
+
+if state == 0 and canTrade
+    if bullTap and trendUp and not (bearTap and trendDown)
+        state := 1
+        dir := 1
+        tapBar := bar_index
+        taps += 1
+
+    else if bearTap and trendDown
+        state := 1
+        dir := -1
+        tapBar := bar_index
+        taps += 1
+
+// ============================================================
+// OPPOSING 1-MINUTE FAIR VALUE GAP
+// ============================================================
+
+bearFVG = high < low[2] and low[2] - high >= minGapTicks * tick
+bullFVG = low > high[2] and low - high[2] >= minGapTicks * tick
+
+if state == 1
+    if bar_index - tapBar > findGapBars
+        state := 0
+
+    else if bar_index > tapBar
+        if dir == 1 and bearFVG
+            gapLo := high
+            gapHi := low[2]
+
+            // Third candle extreme, stored permanently.
+            thirdLow := low
+            thirdHigh := high
+
+            gapBar := bar_index
+            state := 2
+            gaps += 1
+
+        else if dir == -1 and bullFVG
+            gapLo := high[2]
+            gapHi := low
+
+            thirdLow := low
+            thirdHigh := high
+
+            gapBar := bar_index
+            state := 2
+            gaps += 1
+
+// ============================================================
+// IFVG INVERSION AND STRUCTURE BREAK
+// ============================================================
+
+body = math.abs(close - open)
+displacement = body >= atr * bodyATR
+
+breakUp = close > ta.highest(high, structureBars)[1]
+breakDown = close < ta.lowest(low, structureBars)[1]
+
+sweepLongOK = (
+     not requireSweep or
+     (not na(lastSellsideSweep) and
+      bar_index - lastSellsideSweep <= sweepLookback)
+     )
+
+sweepShortOK = (
+     not requireSweep or
+     (not na(lastBuysideSweep) and
+      bar_index - lastBuysideSweep <= sweepLookback)
+     )
+
+longCandidate = (
+     state == 2 and dir == 1 and
+     bar_index > gapBar and
+     close > gapHi and
+     close > open and
+     displacement and
+     breakUp and canTrade
+     )
+
+shortCandidate = (
+     state == 2 and dir == -1 and
+     bar_index > gapBar and
+     close < gapLo and
+     close < open and
+     displacement and
+     breakDown and canTrade
+     )
+
+longSignal = longCandidate and sweepLongOK
+shortSignal = shortCandidate and sweepShortOK
+
+if (longCandidate and not sweepLongOK) or (shortCandidate and not sweepShortOK)
+    sweepRejects += 1
+
+// ============================================================
+// ENTRY, STRUCTURAL STOP, AND RESTING LIQUIDITY
+// ============================================================
+
+if longSignal or shortSignal
+    inversions += 1
+
+    direction = longSignal ? 1 : -1
+
+    // Stop NEVER gets changed to fit contract quantity.
+    stopPrice = direction == 1 ?
+         thirdLow - stopBufferTicks * tick :
+         thirdHigh + stopBufferTicks * tick
+
+    // Baseline matches V22's signal-close sizing.
+    // Prop mode adds an unfavorable fill allowance.
+    estimatedFill = propMode ?
+         (direction == 1 ?
+          close + entryReserveTicks * tick :
+          close - entryReserveTicks * tick) :
+         close
+
+    stopDistance = direction == 1 ?
+         estimatedFill - stopPrice :
+         stopPrice - estimatedFill
+
+    validStop = (
+         stopDistance > tick and
+         stopDistance <= atr * maxStopATR
+         )
+
+    float riskBudget = na
+
+    if propMode
+        remainingDailyRisk = math.max(0.0, dailyLossCap + dailyPnL)
+
+        riskBudget := math.max(
+             0.0,
+             math.min(
+                 propRiskTarget,
+                 propRiskCap,
+                 usableRoom * roomRiskFraction,
+                 remainingDailyRisk * 0.75
+                 )
+             )
+    else
+        riskBudget := math.min(
+             strategy.equity * baselineRiskPct / 100,
+             baselineRiskCap)
+
+    riskPerContract = stopDistance * pointValue + costReserve
+
+    qtyByRisk = (
+         validStop and riskPerContract > 0 and riskBudget > 0
+         ) ? int(math.floor(riskBudget / riskPerContract)) : 0
+
+    // Prop mode checks approximate 10% backtest margin.
+    marginPerContract = estimatedFill * pointValue * 0.10
+
+    qtyByMargin = marginPerContract > 0 ?
+         int(math.floor(math.max(0.0, strategy.equity) * 0.80 / marginPerContract)) :
+         0
+
+    int qty = math.min(maxContracts, qtyByRisk)
+
+    if propMode
+        qty := math.min(qty, qtyByMargin)
+
+    minimumQty = propMode ? 1 : minContracts
+
+    // Only confirmed unswept liquidity may be a target.
+    minDistance = propMode ?
+         minRR * riskPerContract / pointValue :
+         stopDistance * minRR
+
+    maxDistance = stopDistance * maxRR
+
+    float target = na
+
+    if direction == 1
+        if array.size(highLevels) > 0
+            for i = 0 to array.size(highLevels) - 1
+                level = array.get(highLevels, i)
+
+                if (
+                     level > high and
+                     level >= estimatedFill + minDistance and
+                     level <= estimatedFill + maxDistance
+                     )
+                    if na(target) or level < target
+                        target := level
+
+        if (
+             not pdhTaken and not na(pdh) and
+             pdh > high and
+             pdh >= estimatedFill + minDistance and
+             pdh <= estimatedFill + maxDistance
+             )
+            if na(target) or pdh < target
+                target := pdh
+
+    else
+        if array.size(lowLevels) > 0
+            for i = 0 to array.size(lowLevels) - 1
+                level = array.get(lowLevels, i)
+
+                if (
+                     level < low and
+                     level <= estimatedFill - minDistance and
+                     level >= estimatedFill - maxDistance
+                     )
+                    if na(target) or level > target
+                        target := level
+
+        if (
+             not pdlTaken and not na(pdl) and
+             pdl < low and
+             pdl <= estimatedFill - minDistance and
+             pdl >= estimatedFill - maxDistance
+             )
+            if na(target) or pdl > target
+                target := pdl
+
+    if qty < minimumQty
+        riskRejects += 1
+        state := 0
+
+    else if na(target)
+        targetRejects += 1
+        state := 0
+
+    else
+        tradeStop := stopPrice
+        tradeTarget := target
+        submittedBar := bar_index
+
+        if direction == 1
+            strategy.entry(
+                 "LONG",
+                 strategy.long,
+                 qty=qty,
+                 comment="V25 Bull IFVG")
+
+            strategy.exit(
+                 "LONG EXIT",
+                 from_entry="LONG",
+                 stop=tradeStop,
+                 limit=tradeTarget)
+
+        else
+            strategy.entry(
+                 "SHORT",
+                 strategy.short,
+                 qty=qty,
+                 comment="V25 Bear IFVG")
+
+            strategy.exit(
+                 "SHORT EXIT",
+                 from_entry="SHORT",
+                 stop=tradeStop,
+                 limit=tradeTarget)
+
+        tradesToday += 1
+        orders += 1
+        state := 3
+
+        // ADDED: machine-readable entry intent with the original structural
+        // stop and liquidity target. Values are those passed to strategy.exit().
+        if enableWebhook
+            entrySide = direction == 1 ? "buy" : "sell"
+            alert(
+                 f_base("entry", f_eid("entry-" + entrySide)) +
+                 ",\"side\":\"" + entrySide + "\"" +
+                 ",\"qty\":" + str.tostring(qty) +
+                 ",\"order_type\":\"market\"" +
+                 ",\"price\":" + f_num(close) +
+                 ",\"est_fill\":" + f_num(estimatedFill) +
+                 ",\"stop\":" + f_num(tradeStop) +
+                 ",\"target\":" + f_num(tradeTarget) +
+                 ",\"tick_size\":" + str.tostring(tick) +
+                 ",\"point_value\":" + str.tostring(pointValue) +
+                 ",\"risk_per_contract\":" + str.tostring(riskPerContract, "0.00") +
+                 ",\"planned_risk\":" + str.tostring(qty * riskPerContract, "0.00") +
+                 ",\"sizing_mode\":\"" + sizingMode + "\"" +
+                 ",\"comment\":\"" + (direction == 1 ? "V25 Bull IFVG" : "V25 Bear IFVG") + "\"}",
+                 alert.freq_once_per_bar_close)
+
+        if showLabels
+            plannedRisk = qty * riskPerContract
+            plannedReward = qty * (
+                 math.abs(target - estimatedFill) * pointValue -
+                 costReserve)
+
+            label.new(
+                 bar_index,
+                 direction == 1 ? low : high,
+                 (direction == 1 ? "LONG " : "SHORT ") +
+                 str.tostring(qty) + " MNQ" +
+                 "\nRisk ~$" + str.tostring(plannedRisk, "#") +
+                 "\nTarget ~$" + str.tostring(plannedReward, "#") +
+                 "\nR:R " + str.tostring(plannedReward / plannedRisk, "#.##"),
+                 style=direction == 1 ?
+                     label.style_label_up :
+                     label.style_label_down,
+                 color=direction == 1 ? color.teal : color.red,
+                 textcolor=color.white,
+                 size=size.tiny)
+
+// ============================================================
+// EXPIRE INVALIDATED SETUPS
+// ============================================================
+
+if state == 2
+    if bar_index - gapBar > invertBars
+        state := 0
+
+    else if bar_index > gapBar
+        if (
+             (dir == 1 and close < gapLo) or
+             (dir == -1 and close > gapHi)
+             )
+            state := 0
+
+// ============================================================
+// ACTIVE POSITION MANAGEMENT
+// ============================================================
+
+if strategy.position_size > 0 and not na(tradeStop)
+    strategy.exit(
+         "LONG EXIT",
+         from_entry="LONG",
+         stop=tradeStop,
+         limit=tradeTarget)
+
+if strategy.position_size < 0 and not na(tradeStop)
+    strategy.exit(
+         "SHORT EXIT",
+         from_entry="SHORT",
+         stop=tradeStop,
+         limit=tradeTarget)
+
+// Unlock once the submitted trade has completed.
+if (
+     state == 3 and
+     strategy.position_size == 0 and
+     not na(submittedBar) and
+     bar_index > submittedBar + 1
+     )
+    state := 0
+    tradeStop := na
+    tradeTarget := na
+
+// Session flat.
+if afterFlat and strategy.position_size != 0
+    strategy.close_all(
+         comment="NY session flat",
+         immediately=true)
+
+    // ADDED: tell the execution engine to flatten.
+    if enableWebhook and emitExits
+        alert(f_base("flatten", f_eid("flatten-session")) + ",\"reason\":\"session_flat\"}", alert.freq_once_per_bar_close)
+
+// ============================================================
+// WEBHOOK: TRADINGVIEW TRADE CLOSED + BAR PRICES (ADDED)
+// ============================================================
+
+var int whClosedSeen = 0
+
+if strategy.closedtrades > whClosedSeen
+    if enableWebhook and emitExits
+        idx = strategy.closedtrades - 1
+        alert(
+             f_base("exit", f_eid("exit-" + str.tostring(strategy.closedtrades))) +
+             ",\"exit_price\":" + f_num(strategy.closedtrades.exit_price(idx)) +
+             ",\"entry_id\":\"" + strategy.closedtrades.entry_id(idx) + "\"" +
+             ",\"exit_id\":\"" + strategy.closedtrades.exit_id(idx) + "\"" +
+             ",\"trade_qty\":" + str.tostring(int(math.abs(strategy.closedtrades.size(idx)))) +
+             ",\"profit\":" + str.tostring(strategy.closedtrades.profit(idx), "0.00") +
+             ",\"closed_trades\":" + str.tostring(strategy.closedtrades) + "}",
+             alert.freq_once_per_bar_close)
+    whClosedSeen := strategy.closedtrades
+
+if enableWebhook and emitBars and barstate.isconfirmed
+    alert(
+         f_base("bar", f_eid("bar")) +
+         ",\"open\":" + f_num(open) +
+         ",\"high\":" + f_num(high) +
+         ",\"low\":" + f_num(low) +
+         ",\"close\":" + f_num(close) +
+         ",\"volume\":" + str.tostring(nz(volume), "0") + "}",
+         alert.freq_once_per_bar_close)
+
+// ============================================================
+// PLOTS
+// ============================================================
+
+plot(
+     showFVG and state == 2 ? gapHi : na,
+     "Opposing FVG Top",
+     color=color.purple,
+     linewidth=2,
+     style=plot.style_linebr)
+
+plot(
+     showFVG and state == 2 ? gapLo : na,
+     "Opposing FVG Bottom",
+     color=color.purple,
+     linewidth=2,
+     style=plot.style_linebr)
+
+plot(
+     showFVG and state == 2 ?
+         (dir == 1 ? thirdLow : thirdHigh) :
+         na,
+     "Third Candle Extreme",
+     color=color.yellow,
+     linewidth=2,
+     style=plot.style_linebr)
+
+plot(
+     showStops and strategy.position_size != 0 ?
+         tradeStop : na,
+     "Structural Stop",
+     color=color.red,
+     linewidth=2,
+     style=plot.style_linebr)
+
+plot(
+     showStops and strategy.position_size != 0 ?
+         tradeTarget : na,
+     "Resting Liquidity Target",
+     color=color.lime,
+     linewidth=2,
+     style=plot.style_linebr)
+
+// ============================================================
+// DIAGNOSTICS
+// ============================================================
+
+var table stats = table.new(position.top_right, 2, 12, border_width=1)
+
+if barstate.islast and showDashboard
+    table.cell(stats, 0, 0, "V25 DIAGNOSTICS", bgcolor=color.navy, text_color=color.white)
+    table.cell(stats, 1, 0, sizingMode, bgcolor=color.navy, text_color=color.white)
+
+    table.cell(stats, 0, 1, "HTF taps")
+    table.cell(stats, 1, 1, str.tostring(taps))
+
+    table.cell(stats, 0, 2, "Opposing FVGs")
+    table.cell(stats, 1, 2, str.tostring(gaps))
+
+    table.cell(stats, 0, 3, "Inversions")
+    table.cell(stats, 1, 3, str.tostring(inversions))
+
+    table.cell(stats, 0, 4, "Sweep rejects")
+    table.cell(stats, 1, 4, str.tostring(sweepRejects))
+
+    table.cell(stats, 0, 5, "Risk rejects")
+    table.cell(stats, 1, 5, str.tostring(riskRejects))
+
+    table.cell(stats, 0, 6, "Target rejects")
+    table.cell(stats, 1, 6, str.tostring(targetRejects))
+
+    table.cell(stats, 0, 7, "Orders submitted")
+    table.cell(stats, 1, 7, str.tostring(orders))
+
+    table.cell(stats, 0, 8, "Open contracts")
+    table.cell(stats, 1, 8, str.tostring(math.abs(strategy.position_size)))
+
+    table.cell(stats, 0, 9, "Drawdown room (sim.)")
+    table.cell(stats, 1, 9, "$" + str.tostring(drawdownRoom, "#"))
+
+    table.cell(stats, 0, 10, "Daily P&L")
+    table.cell(stats, 1, 10, "$" + str.tostring(dailyPnL, "#"))
+
+    table.cell(stats, 0, 11, "Net profit")
+    table.cell(stats, 1, 11, "$" + str.tostring(strategy.netprofit, "#.##"))
