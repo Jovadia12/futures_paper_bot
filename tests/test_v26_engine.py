@@ -48,7 +48,9 @@ def test_v26_entry_and_bar_validate():
     (lambda d: d.update(sizing_mode="Prop Conservative"), "V26 sizing_mode"),
     (lambda d: d["setup"].update(htf_tf=3), "htf_tf"),
     (lambda d: d["setup"].update(min_rr=1.5), "min_rr"),
-    (lambda d: d["setup"].update(stop_anchor="wick"), "stop_anchor"),
+    (lambda d: d["setup"].update(stop_anchor="structure"), "stop_anchor"),   # earlier draft's alerts
+    (lambda d: d["setup"].update(stop_anchor="boundary"), "stop_anchor"),
+    (lambda d: d["setup"].update(stop_buffer_ticks=0), "Extra inputs"),
     (lambda d: d["setup"].update(extra=1), "Extra inputs"),
     (lambda d: d["setup"]["fvg"]["c2"].update(h=1.0, l=2.0), "high below low"),
 ])
@@ -95,14 +97,12 @@ def test_v25_bot_id_allowlist_rejects_v26(harness):
 
 
 # ============================================================================ accepted entries
-@pytest.mark.parametrize("side,anchor,stop,target", [
-    ("buy", "structure", 19994.0, 20040.0),   # lowest low of the three candles; 20020 is only 1.08R
-    ("buy", "boundary", 20000.0, 20020.0),    # bearish gap bottom = candle-3 high; 20020 is 2.08R
-    ("sell", "structure", 20006.0, 19960.0),  # highest high of the three candles
-    ("sell", "boundary", 20000.0, 19980.0),   # bullish gap top = candle-3 low
+@pytest.mark.parametrize("side,stop,target", [
+    ("buy", 19994.0, 20040.0),   # candle-3 low; 20020 is only 1.08R, 20040 is 2.68R
+    ("sell", 20006.0, 19960.0),  # candle-3 high; mirror image
 ])
-def test_v26_entry_accepted_with_rule_stop_and_liquidity_target(s26, side, anchor, stop, target):
-    code, r = enter(s26, side=side, anchor=anchor)
+def test_v26_entry_accepted_with_candle3_stop_and_liquidity_target(s26, side, stop, target):
+    code, r = enter(s26, side=side)
     assert code == 200 and r["accepted"], r
     assert r["qty"] == 2
     orders = {o.role: o for o in s26.open_orders()}
@@ -111,10 +111,14 @@ def test_v26_entry_accepted_with_rule_stop_and_liquidity_target(s26, side, ancho
     assert r["risk"]["trade_risk"] <= 200
 
 
-def test_stop_buffer_ticks_are_applied_outward(s26):
-    code, r = enter(s26, buffer_ticks=2)
-    assert code == 200, r
-    assert {o.role: o for o in s26.open_orders()}[OrderRole.STOP_LOSS].stop_price == 19993.5
+def test_example_distinguishes_candle3_from_other_stop_definitions():
+    """The fixture is built so the three possible readings give three different prices."""
+    fvg = v26_entry(FakeClock(T0))["setup"]["fvg"]
+    lowest = min(fvg[c]["l"] for c in ("c1", "c2", "c3"))
+    assert (fvg["c3"]["l"], lowest, fvg["bottom"]) == (19994.0, 19990.0, 20000.0)
+    fvg = v26_entry(FakeClock(T0), side="sell")["setup"]["fvg"]
+    highest = max(fvg[c]["h"] for c in ("c1", "c2", "c3"))
+    assert (fvg["c3"]["h"], highest, fvg["top"]) == (20006.0, 20010.0, 20000.0)
 
 
 # ============================================================================ caps agreement
@@ -146,31 +150,39 @@ def test_qty_above_max_contracts_rejected(s26):
 
 
 # ============================================================================ stop rules
-@pytest.mark.parametrize("side,anchor,wrong", [
-    ("buy", "structure", 20000.0),   # boundary price sent while declaring the three-candle extreme
-    ("buy", "boundary", 19994.0),    # the reverse
-    ("buy", "structure", 19993.75),  # widened by a tick
-    ("sell", "structure", 20000.0),
-    ("sell", "boundary", 20006.0),
+@pytest.mark.parametrize("side,wrong,what", [
+    ("buy", 19990.0, "lowest low of all three candles (candle 2)"),
+    ("buy", 20000.0, "FVG boundary (candle-3 high)"),
+    ("buy", 19993.75, "candle-3 low widened by a tick"),
+    ("buy", 19994.25, "candle-3 low tightened by a tick"),
+    ("sell", 20010.0, "highest high of all three candles (candle 2)"),
+    ("sell", 20000.0, "FVG boundary (candle-3 low)"),
+    ("sell", 20006.25, "candle-3 high widened by a tick"),
 ])
-def test_stop_must_match_declared_anchor(s26, side, anchor, wrong):
-    code, r = enter(s26, side=side, anchor=anchor, tamper=lambda d: d.update(stop=wrong))
-    assert code == 422 and "V26 rule check: stop" in reasons(r)
+def test_any_other_stop_is_rejected(s26, side, wrong, what):
+    code, r = enter(s26, side=side, tamper=lambda d: d.update(stop=wrong))
+    assert code == 422, what
+    want = "is not candle 3's low 19994.0 of the inverted bearish FVG" if side == "buy" \
+        else "is not candle 3's high 20006.0 of the inverted bullish FVG"
+    assert f"V26 rule check: stop {wrong} {want}" in reasons(r), what
 
 
-def test_long_stop_uses_lowest_low_of_all_three_candles(s26):
-    """Candle 2 holds the lowest low: the three-candle extreme must use it, not candle 3."""
-    def deeper_c2(d):
-        d["setup"]["fvg"]["c2"]["l"] = 19992.0
-    code, r = enter(s26, tamper=deeper_c2)  # stop still 19994 -> inconsistent
-    assert code == 422 and "lowest low of the three FVG candles 19992.0" in reasons(r)
+def test_candle3_is_the_formation_candle_not_the_inverting_candle(s26):
+    """The inverting bar is the entry bar; a 'candle 3' at or after it is refused."""
+    def c3_is_entry_bar(d):
+        d["setup"]["fvg"]["c3"]["t"] = d["bar_time"]
+    code, r = enter(s26, tamper=c3_is_entry_bar)
+    assert code == 422 and "closed before the entry bar" in reasons(r)
 
 
-def test_short_stop_uses_highest_high_of_all_three_candles(s26):
-    def higher_c1(d):
-        d["setup"]["fvg"]["c1"]["h"] = 20008.0
-    code, r = enter(s26, side="sell", tamper=higher_c1)
-    assert code == 422 and "highest high of the three FVG candles 20008.0" in reasons(r)
+def test_candle3_must_be_the_gap_forming_candle(s26):
+    """Candle 3 is identified by the gap itself: its high is the bearish gap's bottom."""
+    def relabel(d):
+        f = d["setup"]["fvg"]
+        f["c2"], f["c3"] = dict(f["c3"], t=f["c2"]["t"]), dict(f["c2"], t=f["c3"]["t"])
+        d["stop"] = f["c3"]["l"]  # stop on the relabelled 'candle 3' (really candle 2)
+    code, r = enter(s26, tamper=relabel)
+    assert code == 422 and "do not match its candles" in reasons(r)
 
 
 # ============================================================================ FVG candle indexing

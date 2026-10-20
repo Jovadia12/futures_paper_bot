@@ -106,7 +106,7 @@ def test_gap_candles_indexed_explicitly():
 
 
 def test_filters_only_in_filtered_variant():
-    body = SRC[SRC.index("f_filterReason(int dir) =>"):SRC.index("// Stop from")]
+    body = SRC[SRC.index("f_filterReason(int dir) =>"):SRC.index("f_stop(Gap g")]
     assert "if isFiltered" in body
     for flag in ("useTrend", "useSweep", "useDisplacement", "useStructure", "useCandleDir"):
         assert flag in body
@@ -114,10 +114,16 @@ def test_filters_only_in_filtered_variant():
     assert re.search(r'variant = input\.string\("Core"', SRC)
 
 
-def test_stop_from_inverted_gap_candles():
+def test_stop_is_candle3_wick_of_inverted_gap():
+    """Final rule: LONG = candle-3 low, SHORT = candle-3 high; no other reading, no buffer, no inputs."""
     body = SRC[SRC.index("f_stop(Gap g, int dir) =>"):SRC.index("// Nearest untapped")]
-    assert "math.min(g.c1l, g.c2l, g.c3l)" in body and "math.max(g.c1h, g.c2h, g.c3h)" in body
-    assert "g.bottom" in body and "g.top" in body and "math.round_to_mintick" in body
+    code = "\n".join(l for l in body.splitlines() if not l.strip().startswith("//"))
+    assert "math.round_to_mintick(dir == 1 ? g.c3l : g.c3h)" in code
+    for other in ("c1l", "c2l", "c1h", "c2h", "math.min", "math.max", "g.bottom", "g.top", "tick"):
+        assert other not in code.replace("round_to_mintick", ""), other
+    for gone in ("stopAnchor", "stopBufferTicks", "maxStopATR", "Three-candle extreme", "FVG boundary\""):
+        assert gone not in CODE, gone
+    assert "stop := f_stop(g, dir)" in SRC and SRC.count("f_stop(") == 2
 
 
 def test_stop_and_target_set_once_and_never_moved():
@@ -176,7 +182,7 @@ def test_base_keys():
 
 
 def test_entry_keys_match_schema():
-    entry = _keys(_between("f_entryJson(string side", "anchorCode ="))
+    entry = _keys(_between("f_entryJson(string side", "if goLong"))
     caps_keys = {"max_contracts", "max_trade_risk", "cost_reserve", "slippage_ticks"}
     assert BASE | entry - caps_keys == _fields(EntryEvent)
     assert caps_keys == _fields(Caps)
@@ -216,9 +222,9 @@ def test_diag_kinds_and_item_cap_match_schema():
     assert cap == Diag.model_fields["items"].metadata[0].max_length
 
 
-def test_stop_anchor_codes_match_schema():
-    assert 'anchorCode = stopAnchor == "Three-candle extreme" ? "structure" : "boundary"' in SRC
-    assert set(Setup.model_fields["stop_anchor"].annotation.__args__) == {"structure", "boundary"}
+def test_stop_anchor_code_matches_schema():
+    assert ',\\"stop_anchor\\":\\"candle3_wick\\""' in SRC
+    assert set(Setup.model_fields["stop_anchor"].annotation.__args__) == {"candle3_wick"}
 
 
 def test_entry_alerts_once_per_bar_close():

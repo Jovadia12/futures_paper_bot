@@ -111,8 +111,8 @@ class Setup(_Strict):
     zone_time: EpochMs
     tap_time: EpochMs
     fvg: FvgInfo
-    stop_anchor: Literal["structure", "boundary"]
-    stop_buffer_ticks: int = Field(ge=0, le=1000)
+    # The only V26 stop rule: candle 3's wick (low for longs, high for shorts) of the inverted gap.
+    stop_anchor: Literal["candle3_wick"]
     min_gap_ticks: int = Field(ge=1, le=1000)
     target_time: EpochMs
     target_rr: float = Field(gt=0, lt=1000)

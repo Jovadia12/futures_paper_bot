@@ -8,7 +8,8 @@ script, a mis-set input or a corrupted alert cannot reach the paper broker:
 * the opposing 1-minute FVG is a real three-candle gap, in candle order, all
   candles closed before the entry bar, at least ``min_gap_ticks`` wide;
 * the entry close inverted that gap;
-* the stop sits exactly where the declared stop anchor puts it;
+* the stop is exactly candle 3's wick of the inverted gap (low for a long,
+  high for a short; candle 3 = last candle of the gap's original formation);
 * the target is a confirmed swing level from before the entry, offers at least
   MIN_REWARD_RISK, and is the nearest eligible candidate;
 * the declared risk per contract matches the engine's own formula.
@@ -74,18 +75,13 @@ def check(evt: EntryEvent, s: Settings) -> list[str]:
     if not long and not evt.price < g.bottom:
         why.append(f"close {evt.price} did not invert the bullish FVG (bottom {g.bottom})")
 
-    # --- stop from the declared anchor, never moved
-    buffer = st.stop_buffer_ticks * tick
-    if st.stop_anchor == "structure":
-        anchor = min(g.c1.l, g.c2.l, g.c3.l) if long else max(g.c1.h, g.c2.h, g.c3.h)
-        label = "lowest low of the three FVG candles" if long else "highest high of the three FVG candles"
-    else:
-        anchor = g.bottom if long else g.top
-        label = "FVG bottom" if long else "FVG top"
-    exp_stop = _on_tick(anchor, tick) - buffer if long else _on_tick(anchor, tick) + buffer
+    # --- stop: candle 3 of the inverted gap's original formation (low for a long, high for a short).
+    # Not the extreme of all three candles, not the gap boundary, no buffer.
+    anchor = g.c3.l if long else g.c3.h
+    exp_stop = _on_tick(anchor, tick)
     if abs(evt.stop - exp_stop) > EPS:
-        why.append(f"stop {evt.stop} is not the {label} {anchor} "
-                   f"{'-' if long else '+'} {st.stop_buffer_ticks} ticks (expected {round(exp_stop, 10)})")
+        why.append(f"stop {evt.stop} is not candle 3's {'low' if long else 'high'} {anchor} "
+                   f"of the inverted {kind} FVG")
 
     # --- fill estimate and risk per contract (same formula as the risk engine)
     sign = 1 if long else -1

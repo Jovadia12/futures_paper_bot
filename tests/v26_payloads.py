@@ -14,10 +14,11 @@ TICK, PV = 0.25, 2.0
 MIRROR = 40_000.0
 
 # LONG: bearish opposing FVG made of three 1m candles (t offsets in minutes before the entry bar).
-#   c1 high 20010 low 20005 | c2 high 20006 low 19996 | c3 high 20000 low 19994
+#   c1 high 20010 low 20005 | c2 high 20006 low 19990 | c3 high 20000 low 19994
 #   gap top = c1 low 20005, gap bottom = c3 high 20000 (20 ticks)
-#   three-candle extreme (lowest low) = 19994, FVG boundary (bottom) = 20000
-LONG_CANDLES = [(-3, 20010.0, 20005.0), (-2, 20006.0, 19996.0), (-1, 20000.0, 19994.0)]
+#   V26 stop = candle-3 low 19994. Deliberately different from the lowest low of all
+#   three candles (19990, candle 2) and from the FVG boundary (20000).
+LONG_CANDLES = [(-3, 20010.0, 20005.0), (-2, 20006.0, 19990.0), (-1, 20000.0, 19994.0)]
 LONG_CLOSE = 20006.0                       # closes above the gap top 20005: inversion
 LONG_LEVELS = [20020.0, 20040.0, 20060.0]  # untapped swing highs, nearest first
 
@@ -40,8 +41,8 @@ def v26_common(clock, event: str, kind: str | None = None, **kw) -> dict:
     return d
 
 
-def v26_entry(clock, side: str = "buy", anchor: str = "structure", target_index: int | None = None,
-              levels: list[float] | None = None, buffer_ticks: int = 0, caps: dict | None = None,
+def v26_entry(clock, side: str = "buy", target_index: int | None = None,
+              levels: list[float] | None = None, caps: dict | None = None,
               tamper=None, **kw) -> dict:
     """A consistent V26 entry. ``target_index`` picks a level (default: nearest with R >= 2)."""
     long = side == "buy"
@@ -59,11 +60,7 @@ def v26_entry(clock, side: str = "buy", anchor: str = "structure", target_index:
     close = LONG_CLOSE if long else _m(LONG_CLOSE)
     caps = caps or {"max_contracts": 2, "max_trade_risk": 200, "cost_reserve": 8, "slippage_ticks": 2}
     est_fill = close + sign * caps["slippage_ticks"] * TICK
-    if anchor == "structure":
-        base = min(c["l"] for c in candles) if long else max(c["h"] for c in candles)
-    else:
-        base = bottom if long else top
-    stop = base - sign * buffer_ticks * TICK
+    stop = c3["l"] if long else c3["h"]  # candle 3's wick: low for a long, high for a short
     risk = (est_fill - stop) * sign
     lv = levels if levels is not None else (LONG_LEVELS if long else [_m(p) for p in LONG_LEVELS])
     cands = [{"p": p, "t": bar_time - (30 + i) * 60_000} for i, p in enumerate(lv)]
@@ -84,7 +81,7 @@ def v26_entry(clock, side: str = "buy", anchor: str = "structure", target_index:
             "zone_lo": 19970.0 if long else _m(19990.0), "zone_hi": 19990.0 if long else _m(19970.0),
             "zone_time": bar_time - 120 * 60_000, "tap_time": bar_time - 10 * 60_000,
             "fvg": {"c1": c1, "c2": c2, "c3": c3, "top": top, "bottom": bottom},
-            "stop_anchor": anchor, "stop_buffer_ticks": buffer_ticks, "min_gap_ticks": 2,
+            "stop_anchor": "candle3_wick", "min_gap_ticks": 2,
             "target_time": tgt["t"], "target_rr": round(rr, 4), "min_rr": 2, "max_rr": 12,
             "candidates": cands,
         },

@@ -5,7 +5,7 @@
 * The production engine's default `ALLOWED_STRATEGY_VERSIONS=V25-webhook.1` rejects every V26 alert with an explicit reason.
 * V26 is meant to be tested first in the separate staging stack (`docker-compose.staging.yml`, ports 8001/8081). See [Staging](#5-staging-test-without-touching-v25).
 
-> **Needs your confirmation before finalising: the stop anchor.** See [section 2](#2-needs-your-confirmation).
+> **Stop-loss rule: final** (your decision). LONG = the low of **candle 3** of the inverted bearish 1m FVG. SHORT = the high of **candle 3** of the inverted bullish 1m FVG. See [Stop-loss](#stop-loss) and [section 2](#2-stop-loss-rule-final-and-other-choices).
 
 ---
 
@@ -19,7 +19,7 @@
 | Zones tracked | newest zone per side only | every unmitigated zone, including overlapping and cross-timeframe ones |
 | Opposing 1m FVG | first one formed after the tap | **most recent** uninverted one, formed before, during or after the tap |
 | Extra confirmations | always on (1h EMA, sweep, ATR body, 3-bar structure, target availability, formation window) | **Core**: none. **Filtered**: each one is a separate switch |
-| Stop | candle-3 low − 2 ticks | from the inverted gap's three stored candles (two anchors, see section 2) |
+| Stop | candle-3 low − 2 ticks (of the first gap after the tap) | candle-3 wick of the **inverted** gap: low for longs, high for shorts. No buffer |
 | Target | fixed R multiple | nearest confirmed, untapped swing high/low with R ≥ 2. If none, no trade |
 | Size | 3–7 contracts in "V22 Baseline", which the engine rejects (max 2) | same formula and limits as the engine: max 2 contracts, $200 including costs. If 1 contract doesn't fit, no trade |
 
@@ -67,11 +67,31 @@
 
 ### Stop-loss
 
-* **Source.** The stop comes from the specific inverted gap's three stored candles (times, highs and lows of candles 1, 2 and 3 are kept explicitly).
+This is the only stop rule, in both Core and Filtered. It has no inputs.
+
+* **LONG:** the **low** (lower wick) of **candle 3** of the specific bearish 1m FVG that was inverted.
+* **SHORT:** the **high** (upper wick) of **candle 3** of the specific bullish 1m FVG that was inverted.
+* **Candle 3** is the third and last candle of the gap's **original three-candle formation**. It is never the candle that later inverts the gap.
+  * The script stores each gap's three candles (time, high and low of each) at the moment the gap forms.
+  * The stop is read from that stored candle 3.
+* **Not used:**
+  * the lowest low or highest high across all three candles;
+  * the FVG boundary (for a long, candle 3's high);
+  * any buffer ticks.
 * **Rounding.** It is rounded to the instrument tick (0.25 MNQ).
 * **Never moved.** It is set once at entry: `tradeStop` is only assigned at entry or cleared after the trade. A test enforces this.
-* **Buffer.** Optional extra ticks, default 0. They only move the stop **away** from price.
-* **Sanity skip.** Skip the trade if the stop distance is over 10 × ATR (input; 0 = off).
+* **Always valid.** It is always beyond the entry. For a long: candle-3 low ≤ candle-3 high < gap top < inversion close.
+* **Too wide.** If the stop is so far that even 1 contract would risk more than $200 including costs, there is no trade (the sizing rule below).
+
+Worked example (a long; the bearish gap being inverted):
+
+| | High | Low |
+|---|---|---|
+| Candle 1 | 20010.00 | 20005.00 ← gap top |
+| Candle 2 | 20006.00 | 19990.00 |
+| Candle 3 (last candle of the formation) | 20000.00 ← gap bottom | **19994.00 ← stop** |
+
+The stop is **19994.00**. It is not 19990.00 (the lowest of the three candles) and not 20000.00 (the FVG boundary).
 
 ### Take-profit
 
@@ -103,30 +123,14 @@ The four engine values are inputs in section 7 of the script.
 
 ---
 
-## 2. Needs your confirmation
+## 2. Stop-loss rule (final) and other choices
 
-### Stop anchor (your rule is ambiguous; please choose)
+The stop-loss rule is final: candle 3's wick of the inverted gap (see [Stop-loss](#stop-loss)).
 
-Your wording: *"bottom boundary of the inverted bearish 1-minute FVG, corresponding to the lower extreme of its three-candle structure … Do not confuse the FVG's boundary with the third candle's full wick extreme."*
-
-Worked example (a long; the bearish gap being inverted):
-
-| | High | Low |
-|---|---|---|
-| Candle 1 | 20010.00 | **20005.00** ← gap top |
-| Candle 2 | 20006.00 | 19996.00 |
-| Candle 3 | **20000.00** ← gap bottom | 19994.00 |
-
-| Input "Stop anchor" | Long stop in the example | Meaning |
-|---|---|---|
-| **FVG boundary** | **20000.00** | the gap's bottom edge = candle-3 **high** |
-| **Three-candle extreme** (current default) | **19994.00** | lowest low of candles 1–3. In a down-move this is usually candle 3's low, i.e. "the third candle's full wick extreme" |
-
-* **Why it's ambiguous.** The first half of your sentence ("lower extreme of its three-candle structure") describes 19994. The warning ("do not confuse the FVG's boundary with the third candle's full wick extreme") suggests 20000. In most setups the two differ by several points, which changes size, R:R and which targets qualify.
-* **Both are implemented.**
-  * The alert declares the anchor used (`stop_anchor: boundary | structure`).
-  * The engine verifies the stop against exactly that rule: for a long, the lowest low of all three candles (not just candle 3), or the gap bottom.
-* **Default for now.** "Three-candle extreme" is a placeholder until you answer. **Tell me which one is correct** (or a third definition) and I will make it the only option.
+* **Earlier inputs removed.** The earlier draft's "Stop anchor", "Extra ticks beyond the anchor" and "Skip if stop distance exceeds N × ATR" inputs are gone.
+* **Rejected by the engine:**
+  * an entry alert from that draft (`stop_anchor` "structure" or "boundary");
+  * any stop other than candle 3's low (long) or high (short).
 
 ### Other choices I made that you may want to change
 
@@ -139,7 +143,6 @@ Worked example (a long; the bearish gap being inverted):
 | Long and short inverted on the same bar | no trade | logged as `conflict` |
 | Swing confirmation | 5 bars each side on 1m | larger = fewer, stronger levels |
 | Maximum target R | 12 | 0 = no cap |
-| Skip when stop > N × ATR | 10 | 0 = off |
 | Minimum HTF / 1m gap | 4 / 2 ticks | |
 | Filtered variant | all five filters on | each can be switched off |
 
@@ -149,7 +152,7 @@ Worked example (a long; the bearish gap being inverted):
 
 V26 alerts use schema `v26.webhook.v1`, `strategy: "V26"`, `strategy_version: "V26-webhook.1"` and `bot_id: "V26-MNQ-1"`. The event shapes are the same as V25:
 
-* **Entry events** also carry `caps` and `setup`. `setup` holds the zone, the tap, the three FVG candles, the stop anchor, the target time and R, and the 5 nearest candidate levels.
+* **Entry events** also carry `caps` and `setup`. `setup` holds the zone, the tap, the three FVG candles, `stop_anchor: "candle3_wick"`, the target time and R, and the 5 nearest candidate levels.
 * **Bar events** also carry `diag`.
 
 The engine (`v25bot/v26_integrity.py`) rejects a V26 entry with an exact reason unless **all** of these hold:
@@ -158,7 +161,7 @@ The engine (`v25bot/v26_integrity.py`) rejects a V26 entry with an exact reason 
 * The FVG candles are in order (c1 < c2 < c3) and closed before the entry bar.
 * The gap boundaries equal the candles' highs and lows, and the gap is at least the minimum size.
 * The entry close inverted the gap.
-* The stop equals the declared anchor ± buffer, on the tick grid.
+* The stop equals candle 3's low (long) or high (short) of the inverted gap, on the tick grid. "Candle 3" is pinned by the gap itself: the bearish gap's bottom must equal candle 3's high (bullish: the top must equal candle 3's low), and candle 3 must have closed before the entry bar, so it cannot be the inverting candle.
 * `est_fill` and `risk_per_contract` match the engine's formula.
 * The target swing was confirmed before the entry bar and offers R ≥ max(2, `MIN_REWARD_RISK`), and the reported R matches.
 * The target is the nearest eligible listed candidate. If all 5 listed candidates are ineligible, it must lie beyond all of them.
@@ -250,7 +253,6 @@ docker compose -p v25-staging -f docker-compose.staging.yml down -v
 4. Compilation must succeed with no errors. If TradingView reports an error, send me the exact message and line number.
 5. Open the strategy's **Settings → Inputs** and check:
    * "Strategy variant" (Core or Filtered)
-   * "Stop anchor" (see section 2)
    * section 7 = 2 / 200 / 8 / 2, which must match the bot's `.env`
    * "Bot id" = `V26-MNQ-1`
 
@@ -263,7 +265,7 @@ docker compose -p v25-staging -f docker-compose.staging.yml down -v
   * red/green lines = stop/target while in a trade
 * **Diagnostics table** (top right): zones, taps, selections, inversions, entries, and blocks by reason (context/filter/stop/target/size).
 * **Spot-check about 10 trades** against your own reading of the rules, especially:
-  * the stop against your preferred anchor;
+  * that the stop is the low (long) or high (short) of candle 3 of the gap that was inverted;
   * that the target is the nearest untouched swing beyond 2R.
 
 ### V25 vs V26 comparison (historical; nothing was backtested in this repository)
@@ -298,7 +300,6 @@ The output is labelled *historical simulation*. TradingView's 1m history depth l
 ### Verification checklist (staging, several sessions)
 
 - [ ] Script compiles; Strategy Tester trades follow the rules on manual review.
-- [ ] You have confirmed the stop anchor (section 2).
 - [ ] Staging receives bars every minute; **Signals** shows taps, selections and inversions that match the chart.
 - [ ] Every entry alert appears as `alert_received`, then `order_accepted`, or `order_rejected` with an understood reason.
 - [ ] No `does not match engine` or `V26 rule check` rejections. These mean the script and engine disagree and must be fixed, not ignored.
@@ -331,7 +332,7 @@ Never allow both versions in one engine: they would share one position, one trad
 |---|---|
 | Pine syntax | parsed by `pynescript` 0.3.0 (`PINE_PARSE=1 pytest tests/test_pine_v26.py`). It is not TradingView's compiler: type and runtime errors only show in TradingView. |
 | Pine structure | static tests: the 8 timeframes; closed-bar-only HTF reads; explicit candle indexing; filters only in Filtered; stop/target set once; engine-limit defaults equal engine settings; every JSON key matches the engine schema; indentation rules |
-| Engine pipeline | tests through the real FastAPI app and paper broker, using **synthetic** payloads:<br>• accepted long/short with both anchors<br>• caps mismatch<br>• bullish/bearish stop rules<br>• candle indexing<br>• multiple candidates<br>• insufficient R:R<br>• 1-contract risk over the cap<br>• duplicates<br>• intrabar stop/target ambiguity (stop first)<br>• diagnostics storage, dedupe and pruning<br>• production rejection of V26 |
+| Engine pipeline | tests through the real FastAPI app and paper broker, using **synthetic** payloads:<br>• accepted long/short with the candle-3 stop<br>• caps mismatch<br>• bullish/bearish stop rule: every other reading (three-candle extreme, FVG boundary, ±1 tick) rejected; candle 3 cannot be the inverting candle<br>• candle indexing<br>• multiple candidates<br>• insufficient R:R<br>• 1-contract risk over the cap<br>• duplicates<br>• intrabar stop/target ambiguity (stop first)<br>• diagnostics storage, dedupe and pruning<br>• production rejection of V26 |
 | Dashboard | API tests, plus a headless-Chromium render of the Signals page at desktop and phone width |
 
 **Not verified:**

@@ -29,12 +29,12 @@
 //   Variant "Core"    : nothing else.
 //   Variant "Filtered": Core + the filters switched on in section 4.
 //
-// STOP-LOSS: from the specific inverted 1m FVG, using its three stored candles.
-//   "Three-candle extreme" (default): LONG = lowest low of candles 1-3,
-//                                     SHORT = highest high of candles 1-3.
-//   "FVG boundary"                  : LONG = the gap's bottom (candle-3 high),
-//                                     SHORT = the gap's top (candle-3 low).
-//   These two differ on almost every setup; see docs/V26_STRATEGY.md ("needs your confirmation").
+// STOP-LOSS (final rule): candle 3 of the specific opposing 1m FVG that was inverted.
+//   Candle 3 = the third and last candle of the gap's original three-candle formation,
+//   not the candle that later inverts it.
+//   LONG : the LOW (lower wick) of candle 3 of the inverted bearish FVG.
+//   SHORT: the HIGH (upper wick) of candle 3 of the inverted bullish FVG.
+//   Not the extreme of all three candles, not the FVG boundary, no buffer.
 //   Rounded to the instrument tick; set once at entry and never moved.
 //
 // TAKE-PROFIT: the nearest confirmed, untapped swing high (long) / low (short) beyond
@@ -106,11 +106,7 @@ useStructure = input.bool(true, "Close breaks the last", inline="struct", group=
 structureBars = input.int(3, "bars", minval=1, inline="struct", group=gFilters)
 useCandleDir = input.bool(true, "Inversion candle closes in the trade direction", group=gFilters)
 
-gStop = "5. Stop-loss"
-stopAnchor = input.string("Three-candle extreme", "Stop anchor", options=["Three-candle extreme", "FVG boundary"], group=gStop,
-     tooltip="Three-candle extreme: LONG = lowest low of the inverted FVG's 3 candles, SHORT = highest high. FVG boundary: LONG = gap bottom (candle-3 high), SHORT = gap top (candle-3 low).")
-stopBufferTicks = input.int(0, "Extra ticks beyond the anchor", minval=0, group=gStop)
-maxStopATR = input.float(10.0, "Skip if stop distance exceeds N x ATR(14) (0 = off)", minval=0, group=gStop)
+// 5. Stop-loss: fixed rule, no inputs (see header).
 
 gTarget = "6. Take-profit: resting liquidity"
 minRR = input.float(2.0, "Minimum reward:risk", minval=2.0, step=0.25, group=gTarget)
@@ -639,16 +635,9 @@ f_filterReason(int dir) =>
                  useCandleDir and close >= open ? "filter: candle not bearish" : ""
     r
 
-// Stop from the inverted gap's own three candles (see header).
+// Stop = candle 3 of the inverted gap's original formation: its low for a long, its high for a short.
 f_stop(Gap g, int dir) =>
-    float s = na
-    if dir == 1
-        anchor = stopAnchor == "Three-candle extreme" ? math.min(g.c1l, g.c2l, g.c3l) : g.bottom
-        s := math.round_to_mintick(anchor) - stopBufferTicks * tick
-    else
-        anchor = stopAnchor == "Three-candle extreme" ? math.max(g.c1h, g.c2h, g.c3h) : g.top
-        s := math.round_to_mintick(anchor) + stopBufferTicks * tick
-    s
+    math.round_to_mintick(dir == 1 ? g.c3l : g.c3h)
 
 // Nearest untapped swing level beyond the entry with minRR <= R <= maxRR.
 // Returns [target, target time, target R, nearest level's R, JSON of the 5 nearest levels].
@@ -708,8 +697,6 @@ f_plan(Gap g, int dir) =>
         risk = dir == 1 ? estFill - stop : stop - estFill
         if (dir == 1 and stop >= close) or (dir == -1 and stop <= close) or risk <= 0
             reason := "stop: not beyond price"
-        else if maxStopATR > 0 and risk > atr * maxStopATR
-            reason := "stop: distance " + str.tostring(risk, "0.00") + " pts exceeds " + str.tostring(maxStopATR) + " x ATR"
         else
             [t1, t2, t3, nearRR, c] = f_target(dir == 1 ? highLevels : lowLevels, dir, estFill, risk)
             cand := c
@@ -814,14 +801,14 @@ if shortInv and not goShort
     lastBlock := "SHORT " + sReason
     f_push(diagItems, f_item("blocked", -1, shortTf, sStop, sTgt, shortSel.c3t, sReason))
 
-f_setup(int tf, float zlo, float zhi, int zt, int tapT, Gap g, string anchor, int tgtT, float tgtRR, string cand) =>
+f_setup(int tf, float zlo, float zhi, int zt, int tapT, Gap g, int tgtT, float tgtRR, string cand) =>
     "{\"variant\":\"" + (isFiltered ? "filtered" : "core") + "\"" +
      ",\"htf_tf\":" + str.tostring(tf) +
      ",\"zone_lo\":" + f_num(zlo) + ",\"zone_hi\":" + f_num(zhi) + ",\"zone_time\":" + f_int(zt) +
      ",\"tap_time\":" + f_int(tapT) +
      ",\"fvg\":{\"c1\":" + f_candle(g.c1t, g.c1h, g.c1l) + ",\"c2\":" + f_candle(g.c2t, g.c2h, g.c2l) +
      ",\"c3\":" + f_candle(g.c3t, g.c3h, g.c3l) + ",\"top\":" + f_num(g.top) + ",\"bottom\":" + f_num(g.bottom) + "}" +
-     ",\"stop_anchor\":\"" + anchor + "\",\"stop_buffer_ticks\":" + str.tostring(stopBufferTicks) +
+     ",\"stop_anchor\":\"candle3_wick\"" +
      ",\"min_gap_ticks\":" + str.tostring(minGapTicks) +
      ",\"target_time\":" + f_int(tgtT) + ",\"target_rr\":" + str.tostring(tgtRR, "0.0000") +
      ",\"min_rr\":" + str.tostring(minRR) + ",\"max_rr\":" + str.tostring(maxRR) +
@@ -846,8 +833,6 @@ f_entryJson(string side, int qty, float fill, float stop, float tgt, float rpc, 
      ",\"cost_reserve\":" + str.tostring(engCostReserve) + ",\"slippage_ticks\":" + str.tostring(engSlipTicks) + "}" +
      ",\"setup\":" + setupJson + "}"
 
-anchorCode = stopAnchor == "Three-candle extreme" ? "structure" : "boundary"
-
 if goLong
     tradeStop := lStop
     tradeTarget := lTgt
@@ -859,7 +844,7 @@ if goLong
     f_push(diagItems, f_item("entry", 1, longTf, lStop, lTgt, longSel.c3t, "qty " + str.tostring(lQty) + ", R " + str.tostring(lTgtRR, "0.00")))
     if enableWebhook
         alert(f_entryJson("buy", lQty, lFill, lStop, lTgt, lRpc,
-             f_setup(longTf, longZoneLo, longZoneHi, longZoneT, longTapTime, longSel, anchorCode, lTgtT, lTgtRR, lCand)),
+             f_setup(longTf, longZoneLo, longZoneHi, longZoneT, longTapTime, longSel, lTgtT, lTgtRR, lCand)),
              alert.freq_once_per_bar_close)
     if showSetup
         label.new(bar_index, low, "LONG " + str.tostring(lQty) + " MNQ\nstop " + str.tostring(lStop, format.mintick) +
@@ -881,7 +866,7 @@ if goShort
     f_push(diagItems, f_item("entry", -1, shortTf, sStop, sTgt, shortSel.c3t, "qty " + str.tostring(sQty) + ", R " + str.tostring(sTgtRR, "0.00")))
     if enableWebhook
         alert(f_entryJson("sell", sQty, sFill, sStop, sTgt, sRpc,
-             f_setup(shortTf, shortZoneLo, shortZoneHi, shortZoneT, shortTapTime, shortSel, anchorCode, sTgtT, sTgtRR, sCand)),
+             f_setup(shortTf, shortZoneLo, shortZoneHi, shortZoneT, shortTapTime, shortSel, sTgtT, sTgtRR, sCand)),
              alert.freq_once_per_bar_close)
     if showSetup
         label.new(bar_index, high, "SHORT " + str.tostring(sQty) + " MNQ\nstop " + str.tostring(sStop, format.mintick) +
@@ -1054,7 +1039,7 @@ if barstate.islast and showDashboard
     table.cell(stats, 1, 9, str.tostring(blkStop) + " / " + str.tostring(blkTarget) + " / " + str.tostring(blkSize))
     table.cell(stats, 0, 10, "Last block")
     table.cell(stats, 1, 10, lastBlock)
-    table.cell(stats, 0, 11, "Stop anchor")
-    table.cell(stats, 1, 11, stopAnchor)
+    table.cell(stats, 0, 11, "Stop rule")
+    table.cell(stats, 1, 11, "Candle-3 wick of inverted FVG")
     table.cell(stats, 0, 12, "Net profit (TradingView sim.)")
     table.cell(stats, 1, 12, "$" + str.tostring(strategy.netprofit, "#.##"))

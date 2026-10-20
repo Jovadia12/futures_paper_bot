@@ -19,7 +19,7 @@ TradingView V25 (alert() JSON) ─HTTPS─► Caddy (TLS) ─► FastAPI engine 
 
 > **Dashboard:** http://127.0.0.1:8080 on the bot PC, and privately on your iPhone/MacBook through Tailscale. Setup: [docs/DASHBOARD.md](docs/DASHBOARD.md).
 
-> **V26 (not deployed):** `pine/V26_webhook.pine` implements the corrected strategy: 8 HTF timeframes, every unmitigated zone, the most recent opposing 1m FVG, Core/Filtered variants, stops from the inverted gap's candles, liquidity targets ≥ 2R, and engine-matched sizing. The production engine still accepts V25 only. Test V26 in the separate staging stack first: [docs/V26_STRATEGY.md](docs/V26_STRATEGY.md). **The stop anchor needs your confirmation** (section 2 of that file).
+> **V26 (not deployed):** `pine/V26_webhook.pine` implements the corrected strategy: 8 HTF timeframes, every unmitigated zone, the most recent opposing 1m FVG, Core/Filtered variants, a stop at candle 3's wick of the inverted gap (low for longs, high for shorts), liquidity targets ≥ 2R, and engine-matched sizing. The production engine still accepts V25 only. Test V26 in the separate staging stack first: [docs/V26_STRATEGY.md](docs/V26_STRATEGY.md).
 
 ## Contents
 
@@ -279,7 +279,7 @@ The defaults deliberately mirror the original prototype's limits (2 contracts, $
 | `bar` | `open`, `high`, `low`, `close` | Drives paper fills (not persisted as an event; must be newer than the last bar). Ignored as market data for non-paper brokers. |
 | `heartbeat` | – | Liveness |
 
-V26 (`schema: "v26.webhook.v1"`, `strategy: "V26"`): same events. `entry` also requires `caps` (the engine limits the script sized with; must equal the engine's) and `setup` (zone, tap, the inverted FVG's three candles, stop anchor, target candidates), and is checked against the V26 stop/target rules. `bar` may carry `diag` (strategy diagnostics, stored even when the bar itself is not newer). Read them with `GET /admin/diagnostics` (admin token). Details: [docs/V26_STRATEGY.md](docs/V26_STRATEGY.md).
+V26 (`schema: "v26.webhook.v1"`, `strategy: "V26"`): same events. `entry` also requires `caps` (the engine limits the script sized with; must equal the engine's) and `setup` (zone, tap, the inverted FVG's three candles, `stop_anchor: "candle3_wick"`, target candidates), and is checked against the V26 stop/target rules. `bar` may carry `diag` (strategy diagnostics, stored even when the bar itself is not newer). Read them with `GET /admin/diagnostics` (admin token). Details: [docs/V26_STRATEGY.md](docs/V26_STRATEGY.md).
 
 Common fields: `schema`, `strategy`, `strategy_version`, `bot_id`, `event`, `event_id`, `symbol`, `contract`, `timeframe`, `bar_time`, `sent_at` (ms), `passphrase`.
 
@@ -309,7 +309,7 @@ python -m pytest -q
 | `test_dashboard_analytics.py` | Trade reconstruction from fills (partials, flips, flatten reasons), statistics, drawdown, ranges in ET, activity classification, CME hours |
 | `test_dashboard_api.py` | Dashboard against the real engine: figures equal broker state, no fabricated metrics, engine-offline handling, login/lockout/cookies, host allowlist, cross-origin, read-only enforcement, CSP, CSV, V26 Signals page |
 | `test_pine_v26.py` | V26 script: V25 files byte-identical, 8 timeframes, closed-bar-only HTF reads, candle indexing, filters only in Filtered, stop/target set once, engine-limit defaults, JSON keys vs schema. `PINE_PARSE=1` adds a full parse with `pynescript` (about 90 s) |
-| `test_v26_engine.py` | V26 pipeline with synthetic payloads: schema, caps agreement, bullish/bearish stop anchors, FVG candle order and geometry, inversion, multiple targets, insufficient R:R, 1-contract risk cap, duplicates, intrabar stop-first, diagnostics, production rejection |
+| `test_v26_engine.py` | V26 pipeline with synthetic payloads: schema, caps agreement, the candle-3 stop rule for longs and shorts, FVG candle order and geometry, inversion, multiple targets, insufficient R:R, 1-contract risk cap, duplicates, intrabar stop-first, diagnostics, production rejection |
 | `test_staging_compose.py` | Staging stack: own project name, ports, volume; paper-only; V26-only; production still V25-only |
 
 ---
