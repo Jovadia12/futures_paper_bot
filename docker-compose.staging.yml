@@ -1,0 +1,97 @@
+# V26 STAGING: a second, completely separate paper engine + dashboard for
+# testing pine/V26_webhook.pine while the V25 bot keeps running untouched.
+#
+#   docker compose -f docker-compose.staging.yml up -d --build
+#   cloudflared tunnel --url http://localhost:8001      (its own quick tunnel)
+#   dashboard: http://127.0.0.1:8081
+#
+# Separate from the production stack in every way that matters:
+#   * its own compose project ("v25-staging"): own containers, images, network
+#     and database volume. Commands with -f docker-compose.staging.yml never
+#     stop, rebuild or recreate the production containers.
+#   * its own ports (8001 engine, 8081 dashboard), loopback only.
+#   * accepts ONLY V26 alerts (V26-webhook.1 / bot V26-MNQ-1); a V25 alert sent
+#     here is rejected, and the production engine keeps rejecting V26 alerts.
+# It reads the same .env (risk limits stay identical) and the same secrets
+# files; nothing here writes to them.
+#
+# Remove it completely (production unaffected):
+#   docker compose -f docker-compose.staging.yml down -v
+name: v25-staging
+
+services:
+  engine:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PAPER_ONLY: "true"
+      BROKER: "paper"
+      TRADOVATE_ENABLED: "false"
+      LIVE_TRADING_ENABLED: "false"
+      TRUST_PROXY_HEADERS: "true"
+      TRUSTED_PROXIES: "127.0.0.0/8,172.16.0.0/12,192.168.65.0/24"
+      WEBHOOK_TOKEN_FILE: /run/secrets/webhook_token
+      ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      # V26 only. These override the V25 values in .env.
+      ALLOWED_STRATEGY_VERSIONS: "V26-webhook.1"
+      ALLOWED_BOT_IDS: "V26-MNQ-1"
+      MIN_REWARD_RISK: "2.0"
+    secrets: [webhook_token, admin_token]
+    volumes:
+      - staging-data:/data
+    # Loopback only. Never "8001:8000".
+    ports: ["127.0.0.1:8001:8000"]
+    networks: [internal]
+
+  dashboard:
+    build: .
+    command: ["python", "-m", "v25bot.dashboard"]
+    restart: unless-stopped
+    depends_on: [engine]
+    env_file: .env
+    environment:
+      ENGINE_URL: http://engine:8000
+      DASHBOARD_HOST: 0.0.0.0
+      DASHBOARD_PORT: "8080"
+      DASHBOARD_IN_DOCKER: "true"
+      ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      DASHBOARD_PASSWORD_FILE: /run/secrets/dashboard_password
+      PAPER_ONLY: "true"
+      BROKER: "paper"
+      TRADOVATE_ENABLED: "false"
+      LIVE_TRADING_ENABLED: "false"
+      WEBHOOK_TOKEN: ""
+      WEBHOOK_PASSPHRASE: ""
+      ALERT_WEBHOOK_URL: ""
+      TRADOVATE_USERNAME: ""
+      TRADOVATE_PASSWORD: ""
+      TRADOVATE_CID: ""
+      TRADOVATE_SECRET: ""
+    secrets: [admin_token, dashboard_password]
+    # Loopback only. Never "8081:8080".
+    ports: ["127.0.0.1:8081:8080"]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [internal]
+
+secrets:
+  webhook_token:
+    file: ./secrets/webhook_token
+  admin_token:
+    file: ./secrets/admin_token
+  dashboard_password:
+    file: ./secrets/dashboard_password
+
+volumes:
+  staging-data:
+
+networks:
+  internal:

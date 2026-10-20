@@ -16,11 +16,16 @@ import httpx
 
 READ_ONLY_PATHS = frozenset({
     "/health", "/status", "/admin/fills", "/admin/orders", "/admin/events", "/admin/audit",
+    "/admin/diagnostics",
 })
 
 
 class EngineUnavailable(RuntimeError):
     pass
+
+
+class EngineEndpointMissing(EngineUnavailable):
+    """The engine answered 404: it is older than the endpoint (e.g. no V26 diagnostics yet)."""
 
 
 class ReadOnlyEngineClient:
@@ -49,6 +54,8 @@ class ReadOnlyEngineClient:
             raise EngineUnavailable(f"engine unreachable ({type(exc).__name__})") from None
         if resp.status_code == 401:
             raise EngineUnavailable("engine rejected the dashboard's admin token (HTTP 401)")
+        if resp.status_code == 404:
+            raise EngineEndpointMissing(f"engine has no {path} endpoint (HTTP 404)")
         if resp.status_code >= 400:
             raise EngineUnavailable(f"engine returned HTTP {resp.status_code} for {path}")
         return resp.json()
@@ -83,3 +90,7 @@ class ReadOnlyEngineClient:
 
     async def audit(self) -> list[dict]:
         return await self.cached("/admin/audit", {"limit": 1000})
+
+    async def diagnostics(self, since_ms: int | None = None) -> dict:
+        params = {"limit": 500} | ({"since": since_ms} if since_ms else {})
+        return await self.cached("/admin/diagnostics", params)

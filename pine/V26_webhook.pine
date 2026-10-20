@@ -1,0 +1,1060 @@
+//@version=6
+// ============================================================================
+// ICT FVG V26 (webhook) — 8-timeframe HTF FVG → tap → most recent opposing
+// 1-minute FVG → confirmed inversion. Strategy version V26-webhook.1.
+//
+// V25 is NOT modified by this file (pine/V25_original.pine, pine/V25_webhook.pine).
+// Full specification: docs/V26_STRATEGY.md
+//
+// HIGHER-TIMEFRAME FVGs
+//   * Timeframes 5, 10, 15, 30, 45, 60, 120, 240 minutes (each can be switched off).
+//   * A bullish FVG is three COMPLETED HTF candles where candle-3 low > candle-1 high;
+//     the zone is [candle-1 high, candle-3 low]. Bearish mirrors it.
+//   * Non-repainting: request.security(..., lookahead_on) only reads offsets [1]..[3],
+//     i.e. HTF candles that have closed. A zone becomes known on the first 1-minute
+//     bar of the next HTF candle and never changes afterwards.
+//   * Every qualifying FVG is tracked as its own zone (no "newest only").
+//     Overlapping zones, also across timeframes, are kept separately.
+//   * A zone leaves the list when it is
+//       - tapped   : a confirmed 1m bar trades into it (it is now mitigated);
+//       - failed   : a confirmed 1m bar CLOSES beyond its far edge (no tap is counted);
+//       - expired  : older than "Zone expiry";
+//       - evicted  : the list exceeds "Maximum zones" (oldest first).
+//
+// ENTRY (both variants)
+//   LONG : bullish HTF zone tapped → setup armed → the most recent still-uninverted
+//          bearish 1m FVG (formed after, during, or up to N bars before the tap) is
+//          selected → a confirmed 1m CLOSE above that FVG's top = inversion → entry.
+//   SHORT: mirrored.
+//   Variant "Core"    : nothing else.
+//   Variant "Filtered": Core + the filters switched on in section 4.
+//
+// STOP-LOSS: from the specific inverted 1m FVG, using its three stored candles.
+//   "Three-candle extreme" (default): LONG = lowest low of candles 1-3,
+//                                     SHORT = highest high of candles 1-3.
+//   "FVG boundary"                  : LONG = the gap's bottom (candle-3 high),
+//                                     SHORT = the gap's top (candle-3 low).
+//   These two differ on almost every setup; see docs/V26_STRATEGY.md ("needs your confirmation").
+//   Rounded to the instrument tick; set once at entry and never moved.
+//
+// TAKE-PROFIT: the nearest confirmed, untapped swing high (long) / low (short) beyond
+//   the estimated fill with reward:risk >= the minimum (2.0). Swing points are
+//   confirmed by "Swing confirmation bars" on each side and removed the moment price
+//   trades through them. No eligible level → no trade (reason recorded). No fixed-R target.
+//
+// SIZE: identical to the Python engine:
+//   per-contract risk = |est. fill - stop| × point value + cost reserve,
+//   est. fill = close ± slippage ticks, qty = min(MAX_CONTRACTS, floor(MAX_TRADE_RISK / that)).
+//   qty < 1 → no trade.
+// ============================================================================
+strategy("ICT FVG V26 | 8-TF HTF FVG + 1m IFVG",
+     overlay=true,
+     initial_capital=50000,
+     currency=currency.USD,
+     pyramiding=0,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=1.50,
+     slippage=2,
+     process_orders_on_close=false,
+     calc_on_order_fills=false,
+     calc_on_every_tick=false,
+     margin_long=10,
+     margin_short=10,
+     max_labels_count=300,
+     max_boxes_count=500)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+gVariant = "0. Variant"
+variant = input.string("Core", "Strategy variant", options=["Core", "Filtered"], group=gVariant,
+     tooltip="Core: HTF FVG → tap → most recent opposing 1m FVG → confirmed inversion. Filtered: Core plus the filters enabled in section 4.")
+
+gSession = "1. Session (same as V25)"
+tradeSession = input.session("0830-1430", "Entry window NY", group=gSession)
+flatHour = input.int(14, "Flatten hour NY", minval=0, maxval=23, group=gSession)
+flatMinute = input.int(30, "Flatten minute NY", minval=0, maxval=59, group=gSession)
+maxTrades = input.int(2, "Maximum trades per day (= engine MAX_TRADES_PER_DAY)", minval=1, maxval=10, group=gSession)
+
+gHTF = "2. Higher-timeframe FVGs"
+use5 = input.bool(true, "5m", inline="tfA", group=gHTF)
+use10 = input.bool(true, "10m", inline="tfA", group=gHTF)
+use15 = input.bool(true, "15m", inline="tfA", group=gHTF)
+use30 = input.bool(true, "30m", inline="tfA", group=gHTF)
+use45 = input.bool(true, "45m", inline="tfB", group=gHTF)
+use60 = input.bool(true, "1H", inline="tfB", group=gHTF)
+use120 = input.bool(true, "2H", inline="tfB", group=gHTF)
+use240 = input.bool(true, "4H", inline="tfB", group=gHTF)
+minHTFTicks = input.int(4, "Minimum HTF FVG size (ticks)", minval=1, group=gHTF)
+zoneAgeHours = input.int(96, "Zone expiry in hours (0 = never)", minval=0, group=gHTF)
+maxZones = input.int(300, "Maximum zones tracked", minval=20, maxval=450, group=gHTF)
+
+gSetup = "3. Tap → opposing 1m FVG → inversion"
+minGapTicks = input.int(2, "Minimum 1m FVG size (ticks)", minval=1, group=gSetup)
+oppLookbackBars = input.int(60, "Opposing FVG may form up to N bars before the tap (0 = no limit)", minval=0, group=gSetup)
+tapValidBars = input.int(60, "Setup expires N bars after the tap (0 = at session end)", minval=0, group=gSetup)
+
+gFilters = "4. Filters (applied only when variant = Filtered)"
+useTrend = input.bool(true, "1h EMA trend", inline="trend", group=gFilters)
+emaLength = input.int(50, "length", minval=5, inline="trend", group=gFilters)
+useSweep = input.bool(true, "Liquidity sweep within", inline="sweep", group=gFilters)
+sweepLookback = input.int(30, "bars", minval=1, inline="sweep", group=gFilters)
+useDisplacement = input.bool(true, "Inversion body at least", inline="disp", group=gFilters)
+bodyATR = input.float(0.35, "x ATR(14)", minval=0.05, step=0.05, inline="disp", group=gFilters)
+useStructure = input.bool(true, "Close breaks the last", inline="struct", group=gFilters)
+structureBars = input.int(3, "bars", minval=1, inline="struct", group=gFilters)
+useCandleDir = input.bool(true, "Inversion candle closes in the trade direction", group=gFilters)
+
+gStop = "5. Stop-loss"
+stopAnchor = input.string("Three-candle extreme", "Stop anchor", options=["Three-candle extreme", "FVG boundary"], group=gStop,
+     tooltip="Three-candle extreme: LONG = lowest low of the inverted FVG's 3 candles, SHORT = highest high. FVG boundary: LONG = gap bottom (candle-3 high), SHORT = gap top (candle-3 low).")
+stopBufferTicks = input.int(0, "Extra ticks beyond the anchor", minval=0, group=gStop)
+maxStopATR = input.float(10.0, "Skip if stop distance exceeds N x ATR(14) (0 = off)", minval=0, group=gStop)
+
+gTarget = "6. Take-profit: resting liquidity"
+minRR = input.float(2.0, "Minimum reward:risk", minval=2.0, step=0.25, group=gTarget)
+maxRR = input.float(12.0, "Maximum reward:risk (0 = no cap)", minval=0, step=0.5, group=gTarget)
+pivotLength = input.int(5, "Swing confirmation bars (each side)", minval=2, group=gTarget)
+maxLevels = input.int(150, "Stored swing levels per side", minval=10, maxval=300, group=gTarget)
+
+gEngine = "7. Engine risk limits (must equal the bot's .env)"
+engMaxContracts = input.int(2, "MAX_CONTRACTS", minval=1, group=gEngine)
+engMaxRisk = input.float(200, "MAX_TRADE_RISK_USD", minval=1, group=gEngine)
+engCostReserve = input.float(8.0, "COST_RESERVE_PER_CONTRACT_USD", minval=0, group=gEngine)
+engSlipTicks = input.int(2, "RISK_ENTRY_SLIPPAGE_TICKS", minval=0, group=gEngine)
+sizingMode = input.string("Engine limits", "Sizing", options=["Engine limits", "Engine limits + prop budget"], group=gEngine)
+
+gProp = "8. Prop budget (only with 'Engine limits + prop budget')"
+accountStart = input.float(50000, "Account starting balance", minval=1000, group=gProp)
+maxLossAllowance = input.float(2000, "Maximum loss allowance USD", minval=100, group=gProp)
+dailyLossCap = input.float(450, "Internal daily loss cap USD", minval=50, group=gProp)
+safetyBuffer = input.float(400, "Safety reserve above loss floor USD", minval=0, group=gProp)
+roomRiskFraction = input.float(0.20, "Maximum remaining room risk fraction", minval=0.05, maxval=1, step=0.05, group=gProp)
+propRiskTarget = input.float(250, "Prop target planned risk USD", minval=10, group=gProp)
+
+gVisual = "9. Display"
+showZones = input.bool(true, "HTF FVG zones", group=gVisual)
+showSetup = input.bool(true, "Armed setups, selected opposing FVG, stop and target", group=gVisual)
+showDashboard = input.bool(true, "Diagnostics table", group=gVisual)
+
+gHook = "10. Webhook"
+enableWebhook = input.bool(true, "Emit webhook alert() JSON", group=gHook)
+botId = input.string("V26-MNQ-1", "Bot id (letters, digits, - and _ only)", group=gHook)
+hookPassphrase = input.string("", "Optional body passphrase (blank = rely on URL token)", group=gHook)
+emitBars = input.bool(true, "Emit 1m bar prices (paper fill simulation)", group=gHook)
+emitExits = input.bool(true, "Emit TradingView exit / flatten events", group=gHook)
+emitDiag = input.bool(true, "Include strategy diagnostics in bar events", group=gHook)
+
+STRATEGY_VERSION = "V26-webhook.1"
+SCHEMA = "v26.webhook.v1"
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
+// One higher-timeframe FVG zone.
+type Zone
+    int dir
+    int tf
+    float lo
+    float hi
+    int t
+    box bx
+
+// One 1-minute FVG with its three original candles stored explicitly.
+// Bearish (dir = -1, the opposing gap for LONGS): top = candle-1 low, bottom = candle-3 high.
+// Bullish (dir = +1, the opposing gap for SHORTS): top = candle-3 low, bottom = candle-1 high.
+type Gap
+    int dir
+    float top
+    float bottom
+    int c1t
+    int c2t
+    int c3t
+    float c1h
+    float c1l
+    float c2h
+    float c2l
+    float c3h
+    float c3l
+    int bar
+
+// One confirmed swing level (resting liquidity), removed once price trades through it.
+type Level
+    float price
+    int t
+
+// ============================================================================
+// CORE VARIABLES
+// ============================================================================
+
+isFiltered = variant == "Filtered"
+tz = "America/New_York"
+tick = syminfo.mintick
+pointValue = syminfo.pointvalue
+atr = ta.atr(14)
+propMode = sizingMode == "Engine limits + prop budget"
+validChart = timeframe.isminutes and timeframe.multiplier == 1
+inSession = not na(time(timeframe.period, tradeSession, tz))
+nyHour = hour(time, tz)
+nyMinute = minute(time, tz)
+afterFlat = nyHour > flatHour or (nyHour == flatHour and nyMinute >= flatMinute)
+dayKey = year(time, tz) * 10000 + month(time, tz) * 100 + dayofmonth(time, tz)
+newDay = not na(dayKey[1]) and dayKey != dayKey[1]
+
+// ============================================================================
+// JSON HELPERS
+// ============================================================================
+
+f_num(float x) =>
+    na(x) ? "null" : str.tostring(x, format.mintick)
+
+f_int(int x) =>
+    na(x) ? "null" : str.tostring(x)
+
+f_eid(string kind) =>
+    "V26-" + botId + "-" + str.tostring(time) + "-" + kind
+
+f_base(string evt, string eid) =>
+    string chartContract = syminfo.current_contract
+    "{" +
+     "\"schema\":\"" + SCHEMA + "\"," +
+     "\"strategy\":\"V26\"," +
+     "\"strategy_version\":\"" + STRATEGY_VERSION + "\"," +
+     "\"bot_id\":\"" + botId + "\"," +
+     "\"event\":\"" + evt + "\"," +
+     "\"event_id\":\"" + eid + "\"," +
+     "\"symbol\":\"" + syminfo.prefix + ":" + syminfo.ticker + "\"," +
+     "\"contract\":" + (na(chartContract) or chartContract == "" ? "null" : "\"" + chartContract + "\"") + "," +
+     "\"timeframe\":\"" + timeframe.period + "\"," +
+     "\"bar_time\":" + str.tostring(time) + "," +
+     "\"sent_at\":" + str.tostring(timenow) + "," +
+     "\"passphrase\":\"" + hookPassphrase + "\""
+
+f_item(string k, int d, int tf, float lo, float hi, int t, string msg) =>
+    "{\"k\":\"" + k + "\",\"dir\":" + str.tostring(d) + ",\"tf\":" + (tf > 0 ? str.tostring(tf) : "null") +
+     ",\"lo\":" + f_num(lo) + ",\"hi\":" + f_num(hi) + ",\"t\":" + f_int(t) + ",\"msg\":\"" + msg + "\"}"
+
+// At most 20 items per bar keeps the bar alert well inside the engine's MAX_BODY_BYTES (8192).
+f_push(array<string> items, string s) =>
+    if array.size(items) < 20
+        array.push(items, s)
+
+f_candle(int t, float h, float l) =>
+    "{\"t\":" + f_int(t) + ",\"h\":" + f_num(h) + ",\"l\":" + f_num(l) + "}"
+
+// Diagnostic items collected during this bar; sent with the bar event.
+diagItems = array.new<string>()
+
+// ============================================================================
+// TRADE STATE AND PROP BUDGET (prop logic as in V25, used only in prop mode)
+// ============================================================================
+
+var float tradeStop = na
+var float tradeTarget = na
+var int submittedBar = na
+var int tradesToday = 0
+
+var float dayStartEquity = na
+var float peakEodEquity = na
+var float trailingFloor = na
+var bool dailyHalt = false
+var bool accountHalt = false
+
+if barstate.isfirst
+    dayStartEquity := strategy.equity
+    peakEodEquity := accountStart
+    trailingFloor := accountStart - maxLossAllowance
+
+if newDay
+    priorEod = strategy.equity[1]
+    peakEodEquity := math.max(peakEodEquity, priorEod)
+    trailingFloor := math.min(accountStart, peakEodEquity - maxLossAllowance)
+    dayStartEquity := strategy.equity
+    tradesToday := 0
+    dailyHalt := false
+
+dailyPnL = strategy.equity - dayStartEquity
+drawdownRoom = strategy.equity - trailingFloor
+usableRoom = math.max(0.0, drawdownRoom - safetyBuffer)
+
+if propMode
+    if dailyPnL <= -dailyLossCap
+        dailyHalt := true
+    if drawdownRoom <= safetyBuffer
+        accountHalt := true
+
+if propMode and (dailyHalt or accountHalt)
+    strategy.cancel_all()
+    if strategy.position_size != 0
+        strategy.close_all(comment="Prop risk halt", immediately=true)
+        if enableWebhook and emitExits
+            alert(f_base("flatten", f_eid("flatten-prop")) + ",\"reason\":\"prop_risk_halt\"}", alert.freq_once_per_bar_close)
+
+allowedByProp = not propMode or (not dailyHalt and not accountHalt and usableRoom > 0)
+
+// ============================================================================
+// HIGHER-TIMEFRAME FVG DETECTION (completed HTF candles only)
+// ============================================================================
+
+f_htf() =>
+    bull = low[1] > high[3]
+    bear = high[1] < low[3]
+    [bull, bear, high[3], low[1], high[1], low[3], time[1]]
+
+[b5, s5, b5lo, b5hi, s5lo, s5hi, t5] = request.security(syminfo.tickerid, "5", f_htf(), lookahead=barmerge.lookahead_on)
+[b10, s10, b10lo, b10hi, s10lo, s10hi, t10] = request.security(syminfo.tickerid, "10", f_htf(), lookahead=barmerge.lookahead_on)
+[b15, s15, b15lo, b15hi, s15lo, s15hi, t15] = request.security(syminfo.tickerid, "15", f_htf(), lookahead=barmerge.lookahead_on)
+[b30, s30, b30lo, b30hi, s30lo, s30hi, t30] = request.security(syminfo.tickerid, "30", f_htf(), lookahead=barmerge.lookahead_on)
+[b45, s45, b45lo, b45hi, s45lo, s45hi, t45] = request.security(syminfo.tickerid, "45", f_htf(), lookahead=barmerge.lookahead_on)
+[b60, s60, b60lo, b60hi, s60lo, s60hi, t60] = request.security(syminfo.tickerid, "60", f_htf(), lookahead=barmerge.lookahead_on)
+[b120, s120, b120lo, b120hi, s120lo, s120hi, t120] = request.security(syminfo.tickerid, "120", f_htf(), lookahead=barmerge.lookahead_on)
+[b240, s240, b240lo, b240hi, s240lo, s240hi, t240] = request.security(syminfo.tickerid, "240", f_htf(), lookahead=barmerge.lookahead_on)
+
+// 1h EMA trend (Filtered variant only), same non-repainting form as V25.
+ema60 = request.security(syminfo.tickerid, "60", ta.ema(close, emaLength)[1], lookahead=barmerge.lookahead_on)
+close60 = request.security(syminfo.tickerid, "60", close[1], lookahead=barmerge.lookahead_on)
+trendUp = close60 > ema60
+trendDown = close60 < ema60
+
+var array<Zone> zones = array.new<Zone>()
+
+f_addZone(int dir, float lo, float hi, int tf, int t) =>
+    box bx = na
+    if showZones
+        bx := box.new(t, hi, time, lo, xloc=xloc.bar_time, extend=extend.right,
+             border_color=dir == 1 ? color.new(color.teal, 40) : color.new(color.red, 40),
+             bgcolor=dir == 1 ? color.new(color.teal, 90) : color.new(color.red, 90))
+    array.push(zones, Zone.new(dir, tf, lo, hi, t, bx))
+    if array.size(zones) > maxZones
+        old = array.shift(zones)
+        if not na(old.bx)
+            box.delete(old.bx)
+    true
+
+f_onHtf(bool bull, bool bear, float blo, float bhi, float slo, float shi, int tf, int t, array<string> items) =>
+    int added = 0
+    if bull and bhi - blo >= minHTFTicks * tick
+        f_addZone(1, blo, bhi, tf, t)
+        f_push(items, f_item("htf_fvg", 1, tf, blo, bhi, t, ""))
+        added += 1
+    if bear and shi - slo >= minHTFTicks * tick
+        f_addZone(-1, slo, shi, tf, t)
+        f_push(items, f_item("htf_fvg", -1, tf, slo, shi, t, ""))
+        added += 1
+    added
+
+var int htfDetected = 0
+var int last5 = na
+var int last10 = na
+var int last15 = na
+var int last30 = na
+var int last45 = na
+var int last60 = na
+var int last120 = na
+var int last240 = na
+
+if use5 and not na(t5) and (na(last5) or t5 != last5)
+    last5 := t5
+    htfDetected += f_onHtf(b5, s5, b5lo, b5hi, s5lo, s5hi, 5, t5, diagItems)
+if use10 and not na(t10) and (na(last10) or t10 != last10)
+    last10 := t10
+    htfDetected += f_onHtf(b10, s10, b10lo, b10hi, s10lo, s10hi, 10, t10, diagItems)
+if use15 and not na(t15) and (na(last15) or t15 != last15)
+    last15 := t15
+    htfDetected += f_onHtf(b15, s15, b15lo, b15hi, s15lo, s15hi, 15, t15, diagItems)
+if use30 and not na(t30) and (na(last30) or t30 != last30)
+    last30 := t30
+    htfDetected += f_onHtf(b30, s30, b30lo, b30hi, s30lo, s30hi, 30, t30, diagItems)
+if use45 and not na(t45) and (na(last45) or t45 != last45)
+    last45 := t45
+    htfDetected += f_onHtf(b45, s45, b45lo, b45hi, s45lo, s45hi, 45, t45, diagItems)
+if use60 and not na(t60) and (na(last60) or t60 != last60)
+    last60 := t60
+    htfDetected += f_onHtf(b60, s60, b60lo, b60hi, s60lo, s60hi, 60, t60, diagItems)
+if use120 and not na(t120) and (na(last120) or t120 != last120)
+    last120 := t120
+    htfDetected += f_onHtf(b120, s120, b120lo, b120hi, s120lo, s120hi, 120, t120, diagItems)
+if use240 and not na(t240) and (na(last240) or t240 != last240)
+    last240 := t240
+    htfDetected += f_onHtf(b240, s240, b240lo, b240hi, s240lo, s240hi, 240, t240, diagItems)
+
+// ============================================================================
+// RESTING LIQUIDITY (confirmed swing levels) AND SWEEPS
+// ============================================================================
+
+var array<Level> highLevels = array.new<Level>()
+var array<Level> lowLevels = array.new<Level>()
+var int lastSellsideSweep = na
+var int lastBuysideSweep = na
+
+ph = ta.pivothigh(high, pivotLength, pivotLength)
+pl = ta.pivotlow(low, pivotLength, pivotLength)
+
+// A level is consumed the first time price trades at or through it. A wick through
+// that closes back on the other side is also recorded as a sweep (Filtered variant).
+if array.size(highLevels) > 0
+    for i = array.size(highLevels) - 1 to 0
+        lv = array.get(highLevels, i)
+        if high >= lv.price
+            if high > lv.price and close < lv.price
+                lastBuysideSweep := bar_index
+                f_push(diagItems, f_item("sweep", 1, 0, lv.price, lv.price, lv.t, "buy-side"))
+            array.remove(highLevels, i)
+
+if array.size(lowLevels) > 0
+    for i = array.size(lowLevels) - 1 to 0
+        lv = array.get(lowLevels, i)
+        if low <= lv.price
+            if low < lv.price and close > lv.price
+                lastSellsideSweep := bar_index
+                f_push(diagItems, f_item("sweep", -1, 0, lv.price, lv.price, lv.t, "sell-side"))
+            array.remove(lowLevels, i)
+
+// Pivots are confirmed pivotLength bars after the swing bar, using only bars up to now.
+if not na(ph) and high < ph
+    array.push(highLevels, Level.new(ph, time[pivotLength]))
+if not na(pl) and low > pl
+    array.push(lowLevels, Level.new(pl, time[pivotLength]))
+if array.size(highLevels) > maxLevels
+    array.shift(highLevels)
+if array.size(lowLevels) > maxLevels
+    array.shift(lowLevels)
+
+// ============================================================================
+// HTF TAPS, INVALIDATION AND EXPIRY
+// ============================================================================
+
+int bullTapTf = 0
+float bullTapLo = na
+float bullTapHi = na
+int bullTapT = na
+int bearTapTf = 0
+float bearTapLo = na
+float bearTapHi = na
+int bearTapT = na
+maxAgeMs = zoneAgeHours * 3600000
+
+if array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        z = array.get(zones, i)
+        expired = zoneAgeHours > 0 and time - z.t > maxAgeMs
+        failed = z.dir == 1 ? close < z.lo : close > z.hi
+        touched = low <= z.hi and high >= z.lo
+        if expired or failed or touched
+            if failed and not expired
+                f_push(diagItems, f_item("htf_invalid", z.dir, z.tf, z.lo, z.hi, z.t, "closed through zone"))
+            else if touched and not expired
+                f_push(diagItems, f_item("tap", z.dir, z.tf, z.lo, z.hi, z.t, ""))
+                // Several zones can be tapped by one bar: the setup records the highest timeframe.
+                if z.dir == 1 and z.tf > bullTapTf
+                    bullTapTf := z.tf
+                    bullTapLo := z.lo
+                    bullTapHi := z.hi
+                    bullTapT := z.t
+                else if z.dir == -1 and z.tf > bearTapTf
+                    bearTapTf := z.tf
+                    bearTapLo := z.lo
+                    bearTapHi := z.hi
+                    bearTapT := z.t
+            if not na(z.bx)
+                box.delete(z.bx)
+            array.remove(zones, i)
+
+// ============================================================================
+// SETUP STATE (armed by a tap; one per direction)
+// ============================================================================
+
+var bool longArmed = false
+var int longTf = 0
+var float longZoneLo = na
+var float longZoneHi = na
+var int longZoneT = na
+var int longTapBar = na
+var int longTapTime = na
+var int longSelT = na
+
+var bool shortArmed = false
+var int shortTf = 0
+var float shortZoneLo = na
+var float shortZoneHi = na
+var int shortZoneT = na
+var int shortTapBar = na
+var int shortTapTime = na
+var int shortSelT = na
+
+var int tapsArmed = 0
+var int tapsIgnored = 0
+var int oppSelections = 0
+var int inversions = 0
+var int entries = 0
+var int blkContext = 0
+var int blkFilter = 0
+var int blkStop = 0
+var int blkTarget = 0
+var int blkSize = 0
+var string lastBlock = ""
+
+f_ctxReason() =>
+    not validChart ? "chart is not 1-minute" :
+     not inSession ? "outside entry window" :
+     afterFlat ? "after flatten time" :
+     strategy.position_size != 0 ? "position open" :
+     not na(tradeStop) ? "previous trade still active" :
+     tradesToday >= maxTrades ? "max trades per day reached" :
+     not allowedByProp ? "prop budget halt" : ""
+
+// Disarm existing setups first (uses this bar's confirmed close).
+if longArmed
+    string why = ""
+    if close < longZoneLo
+        why := "tapped zone closed through"
+    else if tapValidBars > 0 and bar_index - longTapBar > tapValidBars
+        why := "setup expired"
+    else if not inSession or afterFlat
+        why := "session ended"
+    if why != ""
+        f_push(diagItems, f_item("disarm", 1, longTf, longZoneLo, longZoneHi, longTapTime, why))
+        longArmed := false
+        longSelT := na
+
+if shortArmed
+    string why = ""
+    if close > shortZoneHi
+        why := "tapped zone closed through"
+    else if tapValidBars > 0 and bar_index - shortTapBar > tapValidBars
+        why := "setup expired"
+    else if not inSession or afterFlat
+        why := "session ended"
+    if why != ""
+        f_push(diagItems, f_item("disarm", -1, shortTf, shortZoneLo, shortZoneHi, shortTapTime, why))
+        shortArmed := false
+        shortSelT := na
+
+// A new tap (re-)arms the setup for its direction.
+ctxNow = f_ctxReason()
+bool armLongNow = false
+bool armShortNow = false
+
+if bullTapTf > 0
+    if ctxNow == ""
+        longArmed := true
+        longTf := bullTapTf
+        longZoneLo := bullTapLo
+        longZoneHi := bullTapHi
+        longZoneT := bullTapT
+        longTapBar := bar_index
+        longTapTime := time
+        longSelT := na
+        armLongNow := true
+        tapsArmed += 1
+        f_push(diagItems, f_item("armed", 1, bullTapTf, bullTapLo, bullTapHi, bullTapT, ""))
+    else
+        tapsIgnored += 1
+        f_push(diagItems, f_item("not_armed", 1, bullTapTf, bullTapLo, bullTapHi, bullTapT, ctxNow))
+
+if bearTapTf > 0
+    if ctxNow == ""
+        shortArmed := true
+        shortTf := bearTapTf
+        shortZoneLo := bearTapLo
+        shortZoneHi := bearTapHi
+        shortZoneT := bearTapT
+        shortTapBar := bar_index
+        shortTapTime := time
+        shortSelT := na
+        armShortNow := true
+        tapsArmed += 1
+        f_push(diagItems, f_item("armed", -1, bearTapTf, bearTapLo, bearTapHi, bearTapT, ""))
+    else
+        tapsIgnored += 1
+        f_push(diagItems, f_item("not_armed", -1, bearTapTf, bearTapLo, bearTapHi, bearTapT, ctxNow))
+
+// ============================================================================
+// MOST RECENT OPPOSING 1-MINUTE FVG AND CONFIRMED INVERSION
+// ============================================================================
+
+// Uninverted 1m FVGs in formation order (newest last). Gaps formed before the tap
+// stay eligible within oppLookbackBars; an inverted gap is removed after this bar.
+var array<Gap> bearGaps = array.new<Gap>()
+var array<Gap> bullGaps = array.new<Gap>()
+
+Gap longSel = na
+if longArmed and array.size(bearGaps) > 0
+    g = array.last(bearGaps)
+    if oppLookbackBars == 0 or g.bar >= longTapBar - oppLookbackBars
+        longSel := g
+
+Gap shortSel = na
+if shortArmed and array.size(bullGaps) > 0
+    g = array.last(bullGaps)
+    if oppLookbackBars == 0 or g.bar >= shortTapBar - oppLookbackBars
+        shortSel := g
+
+if not na(longSel)
+    if na(longSelT) or longSel.c3t != longSelT
+        longSelT := longSel.c3t
+        oppSelections += 1
+        f_push(diagItems, f_item("opp_selected", 1, 1, longSel.bottom, longSel.top, longSel.c3t, ""))
+
+if not na(shortSel)
+    if na(shortSelT) or shortSel.c3t != shortSelT
+        shortSelT := shortSel.c3t
+        oppSelections += 1
+        f_push(diagItems, f_item("opp_selected", -1, 1, shortSel.bottom, shortSel.top, shortSel.c3t, ""))
+
+bool longInv = false
+bool shortInv = false
+if not na(longSel)
+    longInv := barstate.isconfirmed and close > longSel.top
+if not na(shortSel)
+    shortInv := barstate.isconfirmed and close < shortSel.bottom
+
+// ============================================================================
+// FILTERS (Filtered variant), STOP, TARGET, SIZE
+// ============================================================================
+
+body = math.abs(close - open)
+displacement = body >= atr * bodyATR
+breakUp = close > ta.highest(high, structureBars)[1]
+breakDown = close < ta.lowest(low, structureBars)[1]
+sweepLongOK = not na(lastSellsideSweep) and bar_index - lastSellsideSweep <= sweepLookback
+sweepShortOK = not na(lastBuysideSweep) and bar_index - lastBuysideSweep <= sweepLookback
+
+f_filterReason(int dir) =>
+    string r = ""
+    if isFiltered
+        if dir == 1
+            r := useTrend and not trendUp ? "filter: 1h trend not up" :
+                 useSweep and not sweepLongOK ? "filter: no sell-side sweep" :
+                 useDisplacement and not displacement ? "filter: body below ATR threshold" :
+                 useStructure and not breakUp ? "filter: no structure break" :
+                 useCandleDir and close <= open ? "filter: candle not bullish" : ""
+        else
+            r := useTrend and not trendDown ? "filter: 1h trend not down" :
+                 useSweep and not sweepShortOK ? "filter: no buy-side sweep" :
+                 useDisplacement and not displacement ? "filter: body below ATR threshold" :
+                 useStructure and not breakDown ? "filter: no structure break" :
+                 useCandleDir and close >= open ? "filter: candle not bearish" : ""
+    r
+
+// Stop from the inverted gap's own three candles (see header).
+f_stop(Gap g, int dir) =>
+    float s = na
+    if dir == 1
+        anchor = stopAnchor == "Three-candle extreme" ? math.min(g.c1l, g.c2l, g.c3l) : g.bottom
+        s := math.round_to_mintick(anchor) - stopBufferTicks * tick
+    else
+        anchor = stopAnchor == "Three-candle extreme" ? math.max(g.c1h, g.c2h, g.c3h) : g.top
+        s := math.round_to_mintick(anchor) + stopBufferTicks * tick
+    s
+
+// Nearest untapped swing level beyond the entry with minRR <= R <= maxRR.
+// Returns [target, target time, target R, nearest level's R, JSON of the 5 nearest levels].
+f_target(array<Level> levels, int dir, float entry, float risk) =>
+    float tgt = na
+    int tgtT = na
+    float nearest = na
+    lowB = dir == 1 ? entry + minRR * risk : entry - (maxRR > 0 ? maxRR * risk : 1e12)
+    highB = dir == 1 ? (maxRR > 0 ? entry + maxRR * risk : 1e12) : entry - minRR * risk
+    if array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            lv = array.get(levels, i)
+            beyond = dir == 1 ? lv.price > entry : lv.price < entry
+            if beyond
+                if na(nearest) or math.abs(lv.price - entry) < math.abs(nearest - entry)
+                    nearest := lv.price
+                if lv.price >= lowB and lv.price <= highB
+                    if na(tgt) or math.abs(lv.price - entry) < math.abs(tgt - entry)
+                        tgt := lv.price
+                        tgtT := lv.t
+    // Up to five nearest levels beyond the entry, nearest first (for the engine's check).
+    string cand = ""
+    float prev = entry
+    for k = 0 to 4
+        float best = na
+        int bestT = na
+        if array.size(levels) > 0
+            for i = 0 to array.size(levels) - 1
+                lv = array.get(levels, i)
+                further = dir == 1 ? lv.price > prev : lv.price < prev
+                if further and (na(best) or math.abs(lv.price - entry) < math.abs(best - entry))
+                    best := lv.price
+                    bestT := lv.t
+        if na(best)
+            break
+        cand := cand + (cand == "" ? "" : ",") + "{\"p\":" + f_num(best) + ",\"t\":" + f_int(bestT) + "}"
+        prev := best
+    tgtRR = na(tgt) ? na : math.abs(tgt - entry) / risk
+    nearRR = na(nearest) ? na : math.abs(nearest - entry) / risk
+    [tgt, tgtT, tgtRR, nearRR, cand]
+
+// Evaluate one direction. Returns [ok, reason, stop, target, targetT, targetRR, qty, perContract, estFill, candidates].
+f_plan(Gap g, int dir) =>
+    string reason = f_ctxReason()
+    float stop = na
+    float tgt = na
+    int tgtT = na
+    float tgtRR = na
+    int qty = 0
+    float rpc = na
+    estFill = dir == 1 ? close + engSlipTicks * tick : close - engSlipTicks * tick
+    string cand = ""
+    if reason == ""
+        reason := f_filterReason(dir)
+    if reason == ""
+        stop := f_stop(g, dir)
+        risk = dir == 1 ? estFill - stop : stop - estFill
+        if (dir == 1 and stop >= close) or (dir == -1 and stop <= close) or risk <= 0
+            reason := "stop: not beyond price"
+        else if maxStopATR > 0 and risk > atr * maxStopATR
+            reason := "stop: distance " + str.tostring(risk, "0.00") + " pts exceeds " + str.tostring(maxStopATR) + " x ATR"
+        else
+            [t1, t2, t3, nearRR, c] = f_target(dir == 1 ? highLevels : lowLevels, dir, estFill, risk)
+            cand := c
+            if na(t1)
+                reason := "target: no untapped swing " + (dir == 1 ? "high" : "low") + " with R in range (nearest " +
+                     (na(nearRR) ? "none" : str.tostring(nearRR, "0.00") + "R") + ")"
+            else
+                tgt := t1
+                tgtT := t2
+                tgtRR := t3
+                rpc := risk * pointValue + engCostReserve
+                qty := math.min(engMaxContracts, int(math.floor(engMaxRisk / rpc)))
+                if propMode
+                    budget = math.max(0.0, math.min(propRiskTarget, usableRoom * roomRiskFraction, math.max(0.0, dailyLossCap + dailyPnL) * 0.75))
+                    qty := math.min(qty, int(math.floor(budget / rpc)))
+                if qty < 1
+                    reason := "size: 1 contract risks $" + str.tostring(rpc, "0.00") + " > $" + str.tostring(engMaxRisk, "0") + " cap"
+    [reason == "", reason, stop, tgt, tgtT, tgtRR, qty, rpc, estFill, cand]
+
+f_blockKind(string reason) =>
+    str.startswith(reason, "filter") ? 1 : str.startswith(reason, "stop") ? 2 : str.startswith(reason, "target") ? 3 :
+     str.startswith(reason, "size") ? 4 : 0
+
+// ============================================================================
+// ENTRY DECISION
+// ============================================================================
+
+bool goLong = false
+bool goShort = false
+string lReason = ""
+string sReason = ""
+float lStop = na
+float lTgt = na
+int lTgtT = na
+float lTgtRR = na
+int lQty = 0
+float lRpc = na
+float lFill = na
+string lCand = ""
+float sStop = na
+float sTgt = na
+int sTgtT = na
+float sTgtRR = na
+int sQty = 0
+float sRpc = na
+float sFill = na
+string sCand = ""
+
+if longInv
+    inversions += 1
+    f_push(diagItems, f_item("inversion", 1, longTf, longSel.bottom, longSel.top, longSel.c3t, ""))
+    [ok, r, st, tg, tgt, trr, q, rpc, ef, cd] = f_plan(longSel, 1)
+    goLong := ok
+    lReason := r
+    lStop := st
+    lTgt := tg
+    lTgtT := tgt
+    lTgtRR := trr
+    lQty := q
+    lRpc := rpc
+    lFill := ef
+    lCand := cd
+
+if shortInv
+    inversions += 1
+    f_push(diagItems, f_item("inversion", -1, shortTf, shortSel.bottom, shortSel.top, shortSel.c3t, ""))
+    [ok, r, st, tg, tgt, trr, q, rpc, ef, cd] = f_plan(shortSel, -1)
+    goShort := ok
+    sReason := r
+    sStop := st
+    sTgt := tg
+    sTgtT := tgt
+    sTgtRR := trr
+    sQty := q
+    sRpc := rpc
+    sFill := ef
+    sCand := cd
+
+if goLong and goShort
+    goLong := false
+    goShort := false
+    lReason := "conflict: long and short inverted on the same bar"
+    sReason := lReason
+
+if longInv and not goLong
+    k = f_blockKind(lReason)
+    blkContext += k == 0 ? 1 : 0
+    blkFilter += k == 1 ? 1 : 0
+    blkStop += k == 2 ? 1 : 0
+    blkTarget += k == 3 ? 1 : 0
+    blkSize += k == 4 ? 1 : 0
+    lastBlock := "LONG " + lReason
+    f_push(diagItems, f_item("blocked", 1, longTf, lStop, lTgt, longSel.c3t, lReason))
+
+if shortInv and not goShort
+    k = f_blockKind(sReason)
+    blkContext += k == 0 ? 1 : 0
+    blkFilter += k == 1 ? 1 : 0
+    blkStop += k == 2 ? 1 : 0
+    blkTarget += k == 3 ? 1 : 0
+    blkSize += k == 4 ? 1 : 0
+    lastBlock := "SHORT " + sReason
+    f_push(diagItems, f_item("blocked", -1, shortTf, sStop, sTgt, shortSel.c3t, sReason))
+
+f_setup(int tf, float zlo, float zhi, int zt, int tapT, Gap g, string anchor, int tgtT, float tgtRR, string cand) =>
+    "{\"variant\":\"" + (isFiltered ? "filtered" : "core") + "\"" +
+     ",\"htf_tf\":" + str.tostring(tf) +
+     ",\"zone_lo\":" + f_num(zlo) + ",\"zone_hi\":" + f_num(zhi) + ",\"zone_time\":" + f_int(zt) +
+     ",\"tap_time\":" + f_int(tapT) +
+     ",\"fvg\":{\"c1\":" + f_candle(g.c1t, g.c1h, g.c1l) + ",\"c2\":" + f_candle(g.c2t, g.c2h, g.c2l) +
+     ",\"c3\":" + f_candle(g.c3t, g.c3h, g.c3l) + ",\"top\":" + f_num(g.top) + ",\"bottom\":" + f_num(g.bottom) + "}" +
+     ",\"stop_anchor\":\"" + anchor + "\",\"stop_buffer_ticks\":" + str.tostring(stopBufferTicks) +
+     ",\"min_gap_ticks\":" + str.tostring(minGapTicks) +
+     ",\"target_time\":" + f_int(tgtT) + ",\"target_rr\":" + str.tostring(tgtRR, "0.0000") +
+     ",\"min_rr\":" + str.tostring(minRR) + ",\"max_rr\":" + str.tostring(maxRR) +
+     ",\"candidates\":[" + cand + "]}"
+
+f_entryJson(string side, int qty, float fill, float stop, float tgt, float rpc, string setupJson) =>
+    f_base("entry", f_eid("entry-" + side)) +
+     ",\"side\":\"" + side + "\"" +
+     ",\"qty\":" + str.tostring(qty) +
+     ",\"order_type\":\"market\"" +
+     ",\"price\":" + f_num(close) +
+     ",\"est_fill\":" + f_num(fill) +
+     ",\"stop\":" + f_num(stop) +
+     ",\"target\":" + f_num(tgt) +
+     ",\"tick_size\":" + str.tostring(tick) +
+     ",\"point_value\":" + str.tostring(pointValue) +
+     ",\"risk_per_contract\":" + str.tostring(rpc, "0.00") +
+     ",\"planned_risk\":" + str.tostring(qty * rpc, "0.00") +
+     ",\"sizing_mode\":\"" + sizingMode + "\"" +
+     ",\"comment\":\"" + (side == "buy" ? "V26 Bull IFVG" : "V26 Bear IFVG") + "\"" +
+     ",\"caps\":{\"max_contracts\":" + str.tostring(engMaxContracts) + ",\"max_trade_risk\":" + str.tostring(engMaxRisk) +
+     ",\"cost_reserve\":" + str.tostring(engCostReserve) + ",\"slippage_ticks\":" + str.tostring(engSlipTicks) + "}" +
+     ",\"setup\":" + setupJson + "}"
+
+anchorCode = stopAnchor == "Three-candle extreme" ? "structure" : "boundary"
+
+if goLong
+    tradeStop := lStop
+    tradeTarget := lTgt
+    submittedBar := bar_index
+    strategy.entry("LONG", strategy.long, qty=lQty, comment="V26 Bull IFVG")
+    strategy.exit("LONG EXIT", from_entry="LONG", stop=tradeStop, limit=tradeTarget)
+    tradesToday += 1
+    entries += 1
+    f_push(diagItems, f_item("entry", 1, longTf, lStop, lTgt, longSel.c3t, "qty " + str.tostring(lQty) + ", R " + str.tostring(lTgtRR, "0.00")))
+    if enableWebhook
+        alert(f_entryJson("buy", lQty, lFill, lStop, lTgt, lRpc,
+             f_setup(longTf, longZoneLo, longZoneHi, longZoneT, longTapTime, longSel, anchorCode, lTgtT, lTgtRR, lCand)),
+             alert.freq_once_per_bar_close)
+    if showSetup
+        label.new(bar_index, low, "LONG " + str.tostring(lQty) + " MNQ\nstop " + str.tostring(lStop, format.mintick) +
+             "\ntarget " + str.tostring(lTgt, format.mintick) + " (" + str.tostring(lTgtRR, "0.0") + "R)",
+             style=label.style_label_up, color=color.teal, textcolor=color.white, size=size.tiny)
+    longArmed := false
+    shortArmed := false
+    longSelT := na
+    shortSelT := na
+
+if goShort
+    tradeStop := sStop
+    tradeTarget := sTgt
+    submittedBar := bar_index
+    strategy.entry("SHORT", strategy.short, qty=sQty, comment="V26 Bear IFVG")
+    strategy.exit("SHORT EXIT", from_entry="SHORT", stop=tradeStop, limit=tradeTarget)
+    tradesToday += 1
+    entries += 1
+    f_push(diagItems, f_item("entry", -1, shortTf, sStop, sTgt, shortSel.c3t, "qty " + str.tostring(sQty) + ", R " + str.tostring(sTgtRR, "0.00")))
+    if enableWebhook
+        alert(f_entryJson("sell", sQty, sFill, sStop, sTgt, sRpc,
+             f_setup(shortTf, shortZoneLo, shortZoneHi, shortZoneT, shortTapTime, shortSel, anchorCode, sTgtT, sTgtRR, sCand)),
+             alert.freq_once_per_bar_close)
+    if showSetup
+        label.new(bar_index, high, "SHORT " + str.tostring(sQty) + " MNQ\nstop " + str.tostring(sStop, format.mintick) +
+             "\ntarget " + str.tostring(sTgt, format.mintick) + " (" + str.tostring(sTgtRR, "0.0") + "R)",
+             style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+    longArmed := false
+    shortArmed := false
+    longSelT := na
+    shortSelT := na
+
+// ============================================================================
+// 1-MINUTE FVG BOOKKEEPING (after the decision, so this bar's gap is never
+// inverted on the bar that formed it)
+// ============================================================================
+
+if array.size(bearGaps) > 0
+    for i = array.size(bearGaps) - 1 to 0
+        g = array.get(bearGaps, i)
+        if close > g.top
+            array.remove(bearGaps, i)
+if array.size(bullGaps) > 0
+    for i = array.size(bullGaps) - 1 to 0
+        g = array.get(bullGaps, i)
+        if close < g.bottom
+            array.remove(bullGaps, i)
+
+// Candle 1 = [2], candle 2 = [1], candle 3 = this confirmed bar.
+if barstate.isconfirmed and high < low[2] and low[2] - high >= minGapTicks * tick
+    array.push(bearGaps, Gap.new(-1, low[2], high, time[2], time[1], time, high[2], low[2], high[1], low[1], high, low, bar_index))
+    if array.size(bearGaps) > 200
+        array.shift(bearGaps)
+if barstate.isconfirmed and low > high[2] and low - high[2] >= minGapTicks * tick
+    array.push(bullGaps, Gap.new(1, low, high[2], time[2], time[1], time, high[2], low[2], high[1], low[1], high, low, bar_index))
+    if array.size(bullGaps) > 200
+        array.shift(bullGaps)
+
+// ============================================================================
+// POSITION MANAGEMENT (stop and target are fixed at entry and never moved)
+// ============================================================================
+
+if strategy.position_size > 0 and not na(tradeStop)
+    strategy.exit("LONG EXIT", from_entry="LONG", stop=tradeStop, limit=tradeTarget)
+
+if strategy.position_size < 0 and not na(tradeStop)
+    strategy.exit("SHORT EXIT", from_entry="SHORT", stop=tradeStop, limit=tradeTarget)
+
+if strategy.position_size == 0 and not na(tradeStop) and not na(submittedBar) and bar_index > submittedBar + 1
+    tradeStop := na
+    tradeTarget := na
+
+if afterFlat and strategy.position_size != 0
+    strategy.close_all(comment="NY session flat", immediately=true)
+    if enableWebhook and emitExits
+        alert(f_base("flatten", f_eid("flatten-session")) + ",\"reason\":\"session_flat\"}", alert.freq_once_per_bar_close)
+
+var int whClosedSeen = 0
+
+if strategy.closedtrades > whClosedSeen
+    if enableWebhook and emitExits
+        idx = strategy.closedtrades - 1
+        alert(
+             f_base("exit", f_eid("exit-" + str.tostring(strategy.closedtrades))) +
+             ",\"exit_price\":" + f_num(strategy.closedtrades.exit_price(idx)) +
+             ",\"entry_id\":\"" + strategy.closedtrades.entry_id(idx) + "\"" +
+             ",\"exit_id\":\"" + strategy.closedtrades.exit_id(idx) + "\"" +
+             ",\"trade_qty\":" + str.tostring(int(math.abs(strategy.closedtrades.size(idx)))) +
+             ",\"profit\":" + str.tostring(strategy.closedtrades.profit(idx), "0.00") +
+             ",\"closed_trades\":" + str.tostring(strategy.closedtrades) + "}",
+             alert.freq_once_per_bar_close)
+    whClosedSeen := strategy.closedtrades
+
+// ============================================================================
+// BAR EVENT WITH DIAGNOSTICS
+// ============================================================================
+
+f_setupState(bool armed, int tf, float zlo, float zhi, int tapT, Gap sel) =>
+    string s = "{\"armed\":" + (armed ? "true" : "false")
+    if armed
+        s := s + ",\"tf\":" + str.tostring(tf) + ",\"zone_lo\":" + f_num(zlo) + ",\"zone_hi\":" + f_num(zhi) + ",\"tap_time\":" + f_int(tapT)
+        if not na(sel)
+            s := s + ",\"opp_lo\":" + f_num(sel.bottom) + ",\"opp_hi\":" + f_num(sel.top) + ",\"opp_time\":" + f_int(sel.c3t)
+    s + "}"
+
+if enableWebhook and emitBars and barstate.isconfirmed
+    string diagJson = ""
+    if emitDiag
+        tfs = array.from(5, 10, 15, 30, 45, 60, 120, 240)
+        string perTf = ""
+        int nBull = 0
+        int nBear = 0
+        for j = 0 to 7
+            tfj = array.get(tfs, j)
+            int cb = 0
+            int cs = 0
+            if array.size(zones) > 0
+                for i = 0 to array.size(zones) - 1
+                    z = array.get(zones, i)
+                    if z.tf == tfj
+                        cb += z.dir == 1 ? 1 : 0
+                        cs += z.dir == -1 ? 1 : 0
+            nBull += cb
+            nBear += cs
+            perTf := perTf + (j == 0 ? "" : ",") + str.tostring(tfj) + ":" + str.tostring(cb) + "/" + str.tostring(cs)
+        diagJson := ",\"diag\":{\"variant\":\"" + (isFiltered ? "filtered" : "core") + "\"" +
+             ",\"zones_bull\":" + str.tostring(nBull) + ",\"zones_bear\":" + str.tostring(nBear) +
+             ",\"zones_tf\":\"" + perTf + "\"" +
+             ",\"long\":" + f_setupState(longArmed, longTf, longZoneLo, longZoneHi, longTapTime, longArmed ? longSel : na) +
+             ",\"short\":" + f_setupState(shortArmed, shortTf, shortZoneLo, shortZoneHi, shortTapTime, shortArmed ? shortSel : na) +
+             ",\"items\":[" + array.join(diagItems, ",") + "]}"
+    alert(
+         f_base("bar", f_eid("bar")) +
+         ",\"open\":" + f_num(open) +
+         ",\"high\":" + f_num(high) +
+         ",\"low\":" + f_num(low) +
+         ",\"close\":" + f_num(close) +
+         ",\"volume\":" + str.tostring(nz(volume), "0") +
+         diagJson + "}",
+         alert.freq_once_per_bar_close)
+
+// ============================================================================
+// PLOTS
+// ============================================================================
+
+plotshape(showSetup and armLongNow, "Long setup armed (HTF tap)", shape.triangleup, location.belowbar, color.teal, size=size.tiny)
+plotshape(showSetup and armShortNow, "Short setup armed (HTF tap)", shape.triangledown, location.abovebar, color.red, size=size.tiny)
+// Fields are read inside if-blocks only: reading a field of an na object is a runtime error.
+float longInvLevel = na
+float shortInvLevel = na
+if showSetup and longArmed and not na(longSel)
+    longInvLevel := longSel.top
+if showSetup and shortArmed and not na(shortSel)
+    shortInvLevel := shortSel.bottom
+plot(longInvLevel, "Long: opposing FVG top (inversion level)", color=color.purple, linewidth=2, style=plot.style_linebr)
+plot(shortInvLevel, "Short: opposing FVG bottom (inversion level)", color=color.orange, linewidth=2, style=plot.style_linebr)
+plot(showSetup and strategy.position_size != 0 ? tradeStop : na, "Stop-loss", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(showSetup and strategy.position_size != 0 ? tradeTarget : na, "Take-profit (resting liquidity)", color=color.lime, linewidth=2, style=plot.style_linebr)
+
+// ============================================================================
+// DIAGNOSTICS TABLE (counts over the loaded chart history)
+// ============================================================================
+
+var table stats = table.new(position.top_right, 2, 13, border_width=1)
+
+if barstate.islast and showDashboard
+    int liveBull = 0
+    int liveBear = 0
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            liveBull += array.get(zones, i).dir == 1 ? 1 : 0
+            liveBear += array.get(zones, i).dir == -1 ? 1 : 0
+    table.cell(stats, 0, 0, "V26 " + variant, bgcolor=color.navy, text_color=color.white)
+    table.cell(stats, 1, 0, STRATEGY_VERSION, bgcolor=color.navy, text_color=color.white)
+    table.cell(stats, 0, 1, "Active HTF zones (bull/bear)")
+    table.cell(stats, 1, 1, str.tostring(liveBull) + " / " + str.tostring(liveBear))
+    table.cell(stats, 0, 2, "HTF FVGs detected")
+    table.cell(stats, 1, 2, str.tostring(htfDetected))
+    table.cell(stats, 0, 3, "Taps that armed a setup")
+    table.cell(stats, 1, 3, str.tostring(tapsArmed))
+    table.cell(stats, 0, 4, "Taps ignored (session/position)")
+    table.cell(stats, 1, 4, str.tostring(tapsIgnored))
+    table.cell(stats, 0, 5, "Opposing FVG selections")
+    table.cell(stats, 1, 5, str.tostring(oppSelections))
+    table.cell(stats, 0, 6, "Confirmed inversions")
+    table.cell(stats, 1, 6, str.tostring(inversions))
+    table.cell(stats, 0, 7, "Entries")
+    table.cell(stats, 1, 7, str.tostring(entries))
+    table.cell(stats, 0, 8, "Blocked: context / filter")
+    table.cell(stats, 1, 8, str.tostring(blkContext) + " / " + str.tostring(blkFilter))
+    table.cell(stats, 0, 9, "Blocked: stop / target / size")
+    table.cell(stats, 1, 9, str.tostring(blkStop) + " / " + str.tostring(blkTarget) + " / " + str.tostring(blkSize))
+    table.cell(stats, 0, 10, "Last block")
+    table.cell(stats, 1, 10, lastBlock)
+    table.cell(stats, 0, 11, "Stop anchor")
+    table.cell(stats, 1, 11, stopAnchor)
+    table.cell(stats, 0, 12, "Net profit (TradingView sim.)")
+    table.cell(stats, 1, 12, "$" + str.tostring(strategy.netprofit, "#.##"))

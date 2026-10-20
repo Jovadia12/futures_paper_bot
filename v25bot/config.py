@@ -143,6 +143,8 @@ class Settings(BaseModel):
     cost_reserve_per_contract_usd: float = 8.0
     risk_entry_slippage_ticks: int = 2
     max_entry_deviation_ticks: int = 8
+    # V26 only: minimum reward:risk an entry's liquidity target must offer (never below 2.0).
+    min_reward_risk: float = 2.0
     entry_window_start: time = time(8, 30)
     entry_window_end: time = time(14, 30)
     flatten_time: time = time(14, 30)
@@ -158,6 +160,7 @@ class Settings(BaseModel):
     tv_exit_action: Literal["flatten", "log"] = "flatten"
     tv_heartbeat_max_age_seconds: float = 0.0
     flatten_retry_attempts: int = 3
+    diagnostics_retention_days: int = 14
 
     # --- Paper simulator -----------------------------------------------------
     paper_commission_per_contract: float = 1.50
@@ -188,6 +191,20 @@ class Settings(BaseModel):
     def _positive(cls, v: int) -> int:
         if v < 1:
             raise ValueError("must be >= 1")
+        return v
+
+    @field_validator("min_reward_risk")
+    @classmethod
+    def _min_rr(cls, v: float) -> float:
+        if not v >= 2.0:
+            raise ValueError("MIN_REWARD_RISK must be >= 2.0 (the V26 strategy requires at least 2:1)")
+        return v
+
+    @field_validator("diagnostics_retention_days")
+    @classmethod
+    def _retention(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("DIAGNOSTICS_RETENTION_DAYS must be >= 1")
         return v
 
     @classmethod
@@ -238,6 +255,7 @@ class Settings(BaseModel):
                 cost_reserve_per_contract_usd=_float("COST_RESERVE_PER_CONTRACT_USD", 8.0),
                 risk_entry_slippage_ticks=_int("RISK_ENTRY_SLIPPAGE_TICKS", 2),
                 max_entry_deviation_ticks=_int("MAX_ENTRY_DEVIATION_TICKS", 8),
+                min_reward_risk=_float("MIN_REWARD_RISK", 2.0),
                 entry_window_start=_time("ENTRY_WINDOW_START", "08:30"),
                 entry_window_end=_time("ENTRY_WINDOW_END", "14:30"),
                 flatten_time=_time("FLATTEN_TIME", "14:30"),
@@ -251,6 +269,7 @@ class Settings(BaseModel):
                 tv_exit_action=(_env("TV_EXIT_ACTION", "flatten") or "flatten").lower(),
                 tv_heartbeat_max_age_seconds=_float("TV_HEARTBEAT_MAX_AGE_SECONDS", 0.0),
                 flatten_retry_attempts=_int("FLATTEN_RETRY_ATTEMPTS", 3),
+                diagnostics_retention_days=_int("DIAGNOSTICS_RETENTION_DAYS", 14),
                 paper_commission_per_contract=_float("PAPER_COMMISSION_PER_CONTRACT", 1.50),
                 paper_slippage_ticks=_int("PAPER_SLIPPAGE_TICKS", 2),
                 paper_book_depth=_int("PAPER_BOOK_DEPTH", 5),

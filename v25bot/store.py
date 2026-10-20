@@ -49,6 +49,23 @@ CREATE TABLE IF NOT EXISTS audit (
     message       TEXT NOT NULL,
     data_json     TEXT
 );
+CREATE TABLE IF NOT EXISTS diagnostics (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    received_at   TEXT NOT NULL,
+    bot_id        TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    bar_time      INTEGER NOT NULL,
+    seq           INTEGER NOT NULL,
+    kind          TEXT NOT NULL,
+    dir           INTEGER,
+    tf            INTEGER,
+    lo            REAL,
+    hi            REAL,
+    t             INTEGER,
+    msg           TEXT NOT NULL DEFAULT '',
+    UNIQUE (bot_id, bar_time, seq)
+);
+CREATE INDEX IF NOT EXISTS diagnostics_bar ON diagnostics(bar_time);
 CREATE TABLE IF NOT EXISTS kv (
     key           TEXT PRIMARY KEY,
     value_json    TEXT NOT NULL,
@@ -175,6 +192,48 @@ class Store:
                 "SELECT ts, level, kind, message, data_json FROM audit ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ diagnostics
+    DIAG_FIELDS = ("kind", "dir", "tf", "lo", "hi", "t", "msg")
+
+    def add_diagnostics(self, bot_id: str, strategy_version: str, bar_time: int,
+                        rows: list[tuple[int, dict]]) -> int:
+        """Insert (seq, row) pairs; a (bot_id, bar_time, seq) already stored is skipped. Returns rows added."""
+        added = 0
+        with self._lock:
+            for seq, row in rows:
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO diagnostics (received_at, bot_id, strategy_version, bar_time, seq, "
+                    "kind, dir, tf, lo, hi, t, msg) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (_now(), bot_id, strategy_version, bar_time, seq,
+                     *(row.get(f) for f in self.DIAG_FIELDS[:-1]), row.get("msg") or ""),
+                )
+                added += cur.rowcount
+        return added
+
+    def recent_diagnostics(self, limit: int = 200, kind: str | None = None,
+                           since_ms: int | None = None) -> list[dict]:
+        sql, args = "SELECT * FROM diagnostics WHERE 1=1", []
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        if since_ms:
+            sql += " AND bar_time>=?"
+            args.append(since_ms)
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY bar_time DESC, seq DESC LIMIT ?", (*args, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def diagnostic_counts(self, since_ms: int | None = None) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT kind, COUNT(*) AS n FROM diagnostics WHERE bar_time>=? GROUP BY kind", (since_ms or 0,)
+            ).fetchall()
+        return {r["kind"]: r["n"] for r in rows}
+
+    def prune_diagnostics(self, before_ms: int) -> int:
+        with self._lock:
+            return self._conn.execute("DELETE FROM diagnostics WHERE bar_time<?", (before_ms,)).rowcount
 
     # ------------------------------------------------------------------ kv
     def get(self, key: str, default: Any = None) -> Any:

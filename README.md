@@ -19,6 +19,8 @@ TradingView V25 (alert() JSON) ─HTTPS─► Caddy (TLS) ─► FastAPI engine 
 
 > **Dashboard:** http://127.0.0.1:8080 on the bot PC, and privately on your iPhone/MacBook through Tailscale. Setup: [docs/DASHBOARD.md](docs/DASHBOARD.md).
 
+> **V26 (not deployed):** `pine/V26_webhook.pine` implements the corrected strategy: 8 HTF timeframes, every unmitigated zone, the most recent opposing 1m FVG, Core/Filtered variants, stops from the inverted gap's candles, liquidity targets ≥ 2R, and engine-matched sizing. The production engine still accepts V25 only. Test V26 in the separate staging stack first: [docs/V26_STRATEGY.md](docs/V26_STRATEGY.md). **The stop anchor needs your confirmation** (section 2 of that file).
+
 ## Contents
 
 1. [Repository layout](#repository-layout)
@@ -40,6 +42,9 @@ TradingView V25 (alert() JSON) ─HTTPS─► Caddy (TLS) ─► FastAPI engine 
 |---|---|
 | `pine/V25_original.pine` | Your V25 script, verbatim (reference). |
 | `pine/V25_webhook.pine` | V25 + machine-readable alerts. **Strategy logic unchanged**; see [docs/PINE_CHANGES.md](docs/PINE_CHANGES.md). |
+| `pine/V26_webhook.pine` | V26: corrected strategy, separate script. See [docs/V26_STRATEGY.md](docs/V26_STRATEGY.md). |
+| `docker-compose.staging.yml` | Separate V26 staging stack (engine `127.0.0.1:8001`, dashboard `127.0.0.1:8081`, own database). |
+| `tools/compare_tv_trades.py` | Compares TradingView "List of trades" exports (e.g. V25 vs V26), labelled as historical simulation. |
 | `v25bot/` | Execution engine (FastAPI). |
 | `v25bot/brokers/paper.py` | Paper broker simulator. |
 | `v25bot/brokers/tradovate.py` | Tradovate adapter: documented API only, **disabled**, unverified against real servers. |
@@ -252,6 +257,9 @@ All settings are environment variables. See [`.env.example`](.env.example) for t
 | `ENTRY_WINDOW_START/END`, `FLATTEN_TIME` | 08:30 / 14:30 / 14:30 | New York time. |
 | `HOLIDAYS` | – | `YYYY-MM-DD,…` dates with no trading. |
 | `MAX_QUOTE_AGE_SECONDS` | 90 | Stale-price threshold. |
+| `ALLOWED_STRATEGY_VERSIONS` / `ALLOWED_BOT_IDS` | `V25-webhook.1` / – | Which scripts the engine trades. Staging sets `V26-webhook.1` / `V26-MNQ-1`. |
+| `MIN_REWARD_RISK` | 2.0 | V26 only: minimum target R the engine accepts (cannot be set below 2). |
+| `DIAGNOSTICS_RETENTION_DAYS` | 14 | V26 strategy diagnostics kept for the dashboard's Signals page. |
 | `TV_EXIT_ACTION` | `flatten` | On a TradingView exit event while the broker still has a position. |
 | `PAPER_SLIPPAGE_TICKS` / `PAPER_COMMISSION_PER_CONTRACT` / `PAPER_BOOK_DEPTH` | 2 / 1.50 / 5 | Simulator. |
 
@@ -270,6 +278,8 @@ The defaults deliberately mirror the original prototype's limits (2 contracts, $
 | `flatten` | `reason` (`session_flat`/`prop_risk_halt`/`manual`) | Flatten all |
 | `bar` | `open`, `high`, `low`, `close` | Drives paper fills (not persisted as an event; must be newer than the last bar). Ignored as market data for non-paper brokers. |
 | `heartbeat` | – | Liveness |
+
+V26 (`schema: "v26.webhook.v1"`, `strategy: "V26"`): same events. `entry` also requires `caps` (the engine limits the script sized with; must equal the engine's) and `setup` (zone, tap, the inverted FVG's three candles, stop anchor, target candidates), and is checked against the V26 stop/target rules. `bar` may carry `diag` (strategy diagnostics, stored even when the bar itself is not newer). Read them with `GET /admin/diagnostics` (admin token). Details: [docs/V26_STRATEGY.md](docs/V26_STRATEGY.md).
 
 Common fields: `schema`, `strategy`, `strategy_version`, `bot_id`, `event`, `event_id`, `symbol`, `contract`, `timeframe`, `bar_time`, `sent_at` (ms), `passphrase`.
 
@@ -297,7 +307,10 @@ python -m pytest -q
 | `test_e2e_http.py` | Real uvicorn server + monitor: entry → duplicate → target → stop gap → trade limit → 14:30 cutoff → kill/resume → outage/reconnect |
 | `test_deploy_config.py` | `docker-compose.yml`: loopback-only port, forced paper mode, opt-in Caddy, dashboard isolation and hardening; IP allowlist through a Cloudflare Tunnel on Docker Desktop, including forged `X-Forwarded-For` |
 | `test_dashboard_analytics.py` | Trade reconstruction from fills (partials, flips, flatten reasons), statistics, drawdown, ranges in ET, activity classification, CME hours |
-| `test_dashboard_api.py` | Dashboard against the real engine: figures equal broker state, no fabricated metrics, engine-offline handling, login/lockout/cookies, host allowlist, cross-origin, read-only enforcement, CSP, CSV |
+| `test_dashboard_api.py` | Dashboard against the real engine: figures equal broker state, no fabricated metrics, engine-offline handling, login/lockout/cookies, host allowlist, cross-origin, read-only enforcement, CSP, CSV, V26 Signals page |
+| `test_pine_v26.py` | V26 script: V25 files byte-identical, 8 timeframes, closed-bar-only HTF reads, candle indexing, filters only in Filtered, stop/target set once, engine-limit defaults, JSON keys vs schema. `PINE_PARSE=1` adds a full parse with `pynescript` (about 90 s) |
+| `test_v26_engine.py` | V26 pipeline with synthetic payloads: schema, caps agreement, bullish/bearish stop anchors, FVG candle order and geometry, inversion, multiple targets, insufficient R:R, 1-contract risk cap, duplicates, intrabar stop-first, diagnostics, production rejection |
+| `test_staging_compose.py` | Staging stack: own project name, ports, volume; paper-only; V26-only; production still V25-only |
 
 ---
 

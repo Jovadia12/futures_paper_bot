@@ -4,6 +4,7 @@
 |---|---|
 | `pine/V25_original.pine` | Your V25 source exactly as supplied in chat (reference, unmodified). |
 | `pine/V25_webhook.pine` | V25 plus webhook output. Version string `V25-webhook.1`. |
+| `pine/V26_webhook.pine` | V26: a separate script that **does** change the strategy logic (`V26-webhook.1`). Documented in [V26_STRATEGY.md](V26_STRATEGY.md). Both V25 files are unchanged, and a test pins their exact bytes. |
 
 ## Strategy logic: unchanged
 

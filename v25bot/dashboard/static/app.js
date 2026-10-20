@@ -561,10 +561,71 @@ function Health({ ov }) {
     </section>`;
 }
 
+// =================================================================== V26 signals
+const SIG_ICON = {
+  htf_fvg: 'analytics', tap: 'target', armed: 'signal', opp_selected: 'activity', inversion: 'up', entry: 'up',
+  alert_received: 'info', order_accepted: 'check', order_rejected: 'x', not_armed: 'minus', disarm: 'pause',
+  blocked: 'stop', htf_invalid: 'x', sweep: 'activity',
+};
+const SIG_CAT = { order_accepted: 'entry', entry: 'entry', order_rejected: 'rejected', blocked: 'risk', htf_invalid: 'warning' };
+const SIG_FILTERS = [
+  ['all', 'All', null], ['pipeline', 'Setups & entries', ['tap', 'armed', 'opp_selected', 'inversion', 'entry']],
+  ['engine', 'Engine decisions', ['alert_received', 'order_accepted', 'order_rejected']],
+  ['blocked', 'Blocked & rejected', ['blocked', 'order_rejected', 'not_armed']],
+  ['zones', 'HTF zones', ['htf_fvg', 'htf_invalid', 'tap']], ['sweep', 'Sweeps', ['sweep']],
+];
+const tfLabel = (tf) => (!isNum(tf) ? '' : tf >= 60 ? `${tf / 60}H` : `${tf}m`);
+const range2 = (lo, hi) => (isNum(lo) && isNum(hi) ? (lo === hi ? price(lo) : `${price(lo)}–${price(hi)}`) : isNum(lo) ? price(lo) : isNum(hi) ? price(hi) : '');
+
+function SetupCard({ title, s }) {
+  if (!s?.armed) return html`<div class="setup-box"><div class="stat-label">${title}</div><div class="muted">Not armed</div></div>`;
+  return html`<div class="setup-box armed"><div class="stat-label">${title} <span class="pill st-good">Armed</span></div>
+    <div>${tfLabel(s.tf)} zone ${range2(s.zone_lo, s.zone_hi)} · tapped ${timeET(s.tap_time)}</div>
+    <div class="muted">${isNum(s.opp_lo) ? `Opposing 1m FVG ${range2(s.opp_lo, s.opp_hi)} (candle 3 ${timeET(s.opp_time)}) · inversion needs a close ${title.startsWith('Long') ? `above ${price(s.opp_hi)}` : `below ${price(s.opp_lo)}`}` : 'Waiting for an opposing 1m FVG'}</div></div>`;
+}
+
+function Signals() {
+  const [range, setRange] = useStored('v25.signals.range', 'today');
+  const [f, setF] = useState('all');
+  const { data, error } = usePoll(`/api/signals?range=${range}`, 5000);
+  if (data && !data.available) return html`<div class="empty"><${Icon} name="info" />${data.reason}</div>`;
+  const kinds = SIG_FILTERS.find((x) => x[0] === f)[2];
+  const items = (data?.timeline || []).filter((i) => !kinds || kinds.includes(i.kind));
+  const max = Math.max(1, ...(data?.funnel || []).map((x) => x.count));
+  return html`
+    ${error ? html`<div class="banner banner-warning"><${Icon} name="alert" /><div><b>Could not refresh</b>${error}</div></div>` : null}
+    <div class="filters"><${RangeSeg} value=${range} set=${setRange} /><span class="card-sub">V26 diagnostics sent by the Pine script with each 1m bar, plus the engine's decision on every entry alert. Times are bar times in ET.</span></div>
+    ${(data?.state || []).map((st) => html`<section class="card section-gap-b"><div class="card-head"><h3 class="card-title">Current state · ${st.bot_id}</h3>
+        <span class="card-sub">${st.strategy_version} · ${st.variant} · last bar ${timeET(st.bar_time)} (${ago(st.age_seconds)})</span></div>
+      <div class="grid half"><${SetupCard} title="Long setup" s=${st.long} /><${SetupCard} title="Short setup" s=${st.short} /></div>
+      <div class="tf-row">${st.zones_tf.map((z) => html`<span class="tf-chip" title=${`${z.bull} bullish / ${z.bear} bearish unmitigated zones`}><b>${tfLabel(z.tf)}</b> <span class="pos">${z.bull}</span>/<span class="neg">${z.bear}</span></span>`)}
+        <span class="muted tiny">Active HTF zones: ${st.zones_bull} bullish / ${st.zones_bear} bearish</span></div>
+    </section>`)}
+    ${data && !data.state?.length ? html`<div class="banner banner-warning"><${Icon} name="info" /><div><b>No V26 bar data yet</b>The current state appears once a V26 bar alert with diagnostics reaches this engine.</div></div>` : null}
+    <div class="grid half">
+      <section class="card"><div class="card-head"><h3 class="card-title">Signal funnel</h3><span class="card-sub">Counts for the selected range</span></div>
+        <ul class="funnel">${(data?.funnel || []).map((x) => html`<li><span>${x.label}</span><progress class=${x.key === 'order_rejected' ? 'neg-bar' : ''} max=${max} value=${x.count} aria-label=${x.label}></progress><b class="tnum">${x.count}</b></li>`)}</ul>
+        <div class="muted tiny other-counts">${(data?.other || []).map((x) => `${x.label}: ${x.count}`).join(' · ')}</div></section>
+      <section class="card"><div class="card-head"><h3 class="card-title">Why entries did not happen</h3><span class="card-sub">Pine blocks and engine rejections, exact text</span></div>
+        ${data?.reasons?.length ? html`<ul class="err-list">${data.reasons.map((r) => html`<li><span class=${`lvl lvl-${r.kind === 'order_rejected' ? 'ERROR' : 'WARNING'}`}>${r.count}×</span><b>${r.kind === 'order_rejected' ? 'Engine' : 'Pine'}</b><div class="sec">${r.reason}</div></li>`)}</ul>`
+          : html`<div class="empty"><${Icon} name="check" />Nothing blocked or rejected in this range.</div>`}</section>
+    </div>
+    <div class="filters section-gap"><div class="chips">${SIG_FILTERS.map(([k, label]) => html`<button class="chip" aria-pressed=${f === k} onClick=${() => setF(k)}>${label}</button>`)}</div></div>
+    <section class="card"><div class="card-head"><h3 class="card-title">Timeline</h3><span class="card-sub">${data?.items_truncated ? 'Latest 500 records' : 'Newest first'} · refreshes every 5s</span></div>
+      ${items.length ? html`<ul class="feed">${items.map((it, i) => html`<li class=${`cat-${SIG_CAT[it.kind] || 'signal'}`} key=${`${it.ts}-${it.kind}-${i}`}>
+          <span class="feed-icon"><${Icon} name=${SIG_ICON[it.kind] || 'info'} /></span>
+          <div><div class="feed-title">${it.label}${it.direction ? ` · ${it.direction}` : ''}${it.tf && it.tf > 1 ? ` · ${tfLabel(it.tf)}` : ''}</div>
+            <div class="feed-detail">${[range2(it.lo, it.hi), it.msg].filter(Boolean).join(' · ')}</div></div>
+          <div class="feed-time">${timeET(it.ts)}<br /><span class="muted">${it.source}</span></div></li>`)}</ul>`
+        : html`<div class="empty"><${Icon} name="signal" />No strategy diagnostics recorded in this range.</div>`}
+    </section>`;
+}
+
 // =================================================================== shell
 const PAGES = [
   ['overview', 'Overview', 'overview'], ['activity', 'Activity', 'activity'], ['trades', 'Trades', 'trades'],
-  ['analytics', 'Analytics', 'analytics'], ['positions', 'Positions', 'positions'], ['health', 'Health', 'health'],
+  ['signals', 'Signals', 'signal'], ['analytics', 'Analytics', 'analytics'], ['positions', 'Positions', 'positions'],
+  ['health', 'Health', 'health'],
 ];
 const pageFromHash = () => { const p = location.hash.replace('#/', ''); return PAGES.some((x) => x[0] === p) ? p : 'overview'; };
 
@@ -585,7 +646,7 @@ function App() {
   const [es, el] = engineStatus(hl);
   const [ts, tl] = tvStatus(hl);
   const modeVal = hl?.mode?.paper_only ? 'PAPER' : hl?.mode?.mode || dash;
-  const view = { overview: Overview, activity: Activity, trades: Trades, analytics: Analytics, positions: Positions, health: Health }[page];
+  const view = { overview: Overview, activity: Activity, trades: Trades, signals: Signals, analytics: Analytics, positions: Positions, health: Health }[page];
   return html`<div class="shell">
     <aside class="sidebar">
       <div class="brand"><div class="brand-mark">V25</div><div><div class="brand-name">V25 Monitor</div><div class="brand-sub">ICT FVG · MNQ</div></div></div>

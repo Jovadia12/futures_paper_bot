@@ -53,8 +53,11 @@ _helper = WEBHOOK[_helper_start:WEBHOOK.index("// ====", _helper_start)]
 BASE = set(re.findall(r'\\"([a-z_]+)\\":', _helper))
 
 
+V26_ONLY = {"caps", "setup", "diag"}  # optional schema fields the V25 script never sends
+
+
 def _schema_fields(model) -> set[str]:
-    return {f.alias or name for name, f in model.model_fields.items()}
+    return {f.alias or name for name, f in model.model_fields.items()} - V26_ONLY
 
 
 def test_base_fields_match_schema():

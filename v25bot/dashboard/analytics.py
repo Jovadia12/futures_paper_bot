@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -453,3 +453,86 @@ def cme_equity_futures_open(now: datetime) -> bool:
     if wd == 4:
         return h < 17
     return not (h == 17)
+
+
+# ============================================================================ V26 strategy diagnostics
+SIGNAL_LABELS = {
+    "htf_fvg": "HTF FVG detected", "tap": "HTF zone tapped", "armed": "Setup armed",
+    "opp_selected": "Opposing 1m FVG selected", "inversion": "Inversion confirmed", "entry": "Entry generated",
+    "alert_received": "Alert received by engine", "order_accepted": "Order accepted",
+    "order_rejected": "Order rejected", "not_armed": "Tap ignored", "disarm": "Setup disarmed",
+    "blocked": "Entry blocked in Pine", "htf_invalid": "HTF zone invalidated", "sweep": "Liquidity sweep",
+}
+FUNNEL = ("htf_fvg", "tap", "armed", "opp_selected", "inversion", "entry", "alert_received", "order_accepted",
+          "order_rejected")
+OTHER = ("blocked", "not_armed", "disarm", "htf_invalid", "sweep")
+ENGINE_KINDS = {"alert_received", "order_accepted", "order_rejected"}
+ZONE_KINDS = {"htf_fvg", "htf_invalid", "tap"}
+
+
+def _ms_iso(ms) -> str | None:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat() if isinstance(ms, (int, float)) else None
+
+
+def _direction(kind: str, d) -> str | None:
+    if d not in (1, -1):
+        return None
+    if kind in ZONE_KINDS:
+        return "bullish" if d == 1 else "bearish"
+    if kind == "sweep":
+        return "buy-side" if d == 1 else "sell-side"
+    return "long" if d == 1 else "short"
+
+
+def _setup_view(s: dict | None) -> dict:
+    s = s or {}
+    out = {"armed": bool(s.get("armed"))}
+    if out["armed"]:
+        out |= {"tf": s.get("tf"), "zone_lo": s.get("zone_lo"), "zone_hi": s.get("zone_hi"),
+                "tap_time": _ms_iso(s.get("tap_time")), "opp_lo": s.get("opp_lo"), "opp_hi": s.get("opp_hi"),
+                "opp_time": _ms_iso(s.get("opp_time"))}
+    return out
+
+
+def signals(diag: dict, now: datetime) -> dict:
+    """Shape the engine's /admin/diagnostics answer for the Signals page. Counts are the engine's own."""
+    counts = diag.get("counts") or {}
+    items = []
+    for r in diag.get("items") or []:
+        kind = r.get("kind")
+        items.append({
+            "ts": _ms_iso(r.get("bar_time")), "kind": kind, "label": SIGNAL_LABELS.get(kind, kind),
+            "direction": _direction(kind, r.get("dir")), "tf": r.get("tf"), "lo": r.get("lo"), "hi": r.get("hi"),
+            "ref_time": _ms_iso(r.get("t")), "msg": r.get("msg") or "", "bot_id": r.get("bot_id"),
+            "source": "engine" if kind in ENGINE_KINDS else "TradingView",
+        })
+    reasons = Counter()
+    for it in items:
+        if it["kind"] in ("blocked", "order_rejected") and it["msg"]:
+            reasons[(it["kind"], it["msg"].split(";")[0][:120])] += 1
+    state = []
+    for bot_id, s in sorted((diag.get("strategy_state") or {}).items()):
+        bar = parse_ts(_ms_iso(s.get("bar_time")))
+        received = parse_ts(s.get("received_at"))
+        per_tf = []
+        for part in (s.get("zones_tf") or "").split(","):
+            tf, _, bb = part.partition(":")
+            bull, _, bear = bb.partition("/")
+            if tf.isdigit() and bull.isdigit() and bear.isdigit():
+                per_tf.append({"tf": int(tf), "bull": int(bull), "bear": int(bear)})
+        state.append({
+            "bot_id": bot_id, "strategy_version": s.get("strategy_version"), "variant": s.get("variant"),
+            "bar_time": bar.isoformat() if bar else None,
+            "age_seconds": (now - received).total_seconds() if received else None,
+            "zones_bull": s.get("zones_bull"), "zones_bear": s.get("zones_bear"), "zones_tf": per_tf,
+            "close": s.get("close"), "long": _setup_view(s.get("long")), "short": _setup_view(s.get("short")),
+        })
+    return {
+        "available": True,
+        "funnel": [{"key": k, "label": SIGNAL_LABELS[k], "count": counts.get(k, 0)} for k in FUNNEL],
+        "other": [{"key": k, "label": SIGNAL_LABELS[k], "count": counts.get(k, 0)} for k in OTHER],
+        "reasons": [{"kind": k, "reason": r, "count": n} for (k, r), n in reasons.most_common(12)],
+        "state": state,
+        "timeline": items,
+        "items_truncated": len(items) >= 500,
+    }

@@ -1,2 +1,3 @@
 -r requirements.txt
 pytest==9.1.1
+pynescript==0.3.0  # optional Pine syntax check: PINE_PARSE=1 pytest tests/test_pine_v26.py

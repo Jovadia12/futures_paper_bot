@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from . import contracts
+from . import contracts, v26_integrity
 from .alerts import AlertManager
 from .brokers.base import (
     AccountSnapshot,
@@ -150,7 +150,10 @@ class ExecutionEngine:
     # ================================================================= events
     async def handle_entry(self, evt: EntryEvent) -> tuple[int, dict]:
         async with self.lock:
-            return await self._handle_entry(evt)
+            code, result = await self._handle_entry(evt)
+        if evt.is_v26:
+            self._record_entry_outcome(evt, result)
+        return code, result
 
     async def _handle_entry(self, evt: EntryEvent) -> tuple[int, dict]:
         now = self.clock.now()
@@ -170,7 +173,7 @@ class ExecutionEngine:
         if self.s.allowed_bot_ids and evt.bot_id not in self.s.allowed_bot_ids and evt.bot_id != "legacy":
             return rejected(422, f"bot_id {evt.bot_id!r} not allowlisted")
         if evt.timeframe != "1":
-            return rejected(422, f"V25 entries are only valid from a 1-minute chart (got {evt.timeframe!r})")
+            return rejected(422, f"{evt.strategy} entries are only valid from a 1-minute chart (got {evt.timeframe!r})")
 
         try:
             res = contracts.resolve(
@@ -190,6 +193,13 @@ class ExecutionEngine:
         if abs(evt.tick_size - spec.tick_size) > 1e-9 or abs(evt.point_value - spec.point_value) > 1e-9:
             return rejected(422, f"alert tick/point value {evt.tick_size}/{evt.point_value} do not match "
                                  f"{contract.root} {spec.tick_size}/{spec.point_value}: wrong chart symbol?")
+        if evt.is_v26:
+            mismatch = v26_integrity.caps_mismatch(evt, self.s)
+            if mismatch:
+                return rejected(422, *mismatch)
+            broken = v26_integrity.check(evt, self.s)
+            if broken:
+                return rejected(422, *(f"V26 rule check: {why}" for why in broken))
 
         # Paper only: the signal's close is the freshest known price. Live adapters
         # must use a real market-data feed, so the signal never stands in for one there.
@@ -271,7 +281,7 @@ class ExecutionEngine:
         async with self.lock:
             positions = await self._positions_or_none()
             open_qty = {p.symbol: p.qty for p in positions or []}
-            msg = (f"TradingView reports V25 trade closed at {evt.exit_price} ({evt.exit_id or 'exit'}); "
+            msg = (f"TradingView reports {evt.strategy} trade closed at {evt.exit_price} ({evt.exit_id or 'exit'}); "
                    f"broker positions: {open_qty or 'flat'}")
             if not open_qty:
                 self.alerts.emit("info", "tv_exit", msg, dedupe_seconds=0)
@@ -299,6 +309,10 @@ class ExecutionEngine:
         except contracts.ContractError as exc:
             return 409, {"status": "ignored", "reason": str(exc)}
         symbol = res.contract.name
+        # Diagnostics first: the entry on this bar already advanced last_bar_time, and the
+        # bar event's diagnostics describe that same bar. They are idempotent per bar.
+        if evt.diag is not None:
+            self._record_diag(evt)
         key = f"last_bar_time:{symbol}"
         if evt.bar_time <= self.store.get(key, 0):
             return 200, {"status": "ignored", "reason": "bar not newer than last processed bar"}
@@ -311,6 +325,52 @@ class ExecutionEngine:
         async with self.lock:
             await self.broker.on_bar(symbol, evt.open, evt.high, evt.low, evt.close, ts)
         return 200, {"status": "processed", "contract": symbol}
+
+    # ================================================================= V26 diagnostics
+    def _diag_allowed(self, evt) -> bool:
+        return ((not self.s.allowed_strategy_versions or evt.strategy_version in self.s.allowed_strategy_versions)
+                and (not self.s.allowed_bot_ids or evt.bot_id in self.s.allowed_bot_ids))
+
+    def _record_diag(self, evt: BarEvent) -> None:
+        if not self._diag_allowed(evt):
+            return
+        d = evt.diag
+        rows = [(i, {"kind": it.k, "dir": it.dir, "tf": it.tf, "lo": it.lo, "hi": it.hi, "t": it.t, "msg": it.msg})
+                for i, it in enumerate(d.items)]
+        self.store.add_diagnostics(evt.bot_id, evt.strategy_version, evt.bar_time, rows)
+        states = self.store.get("strategy_state", {})
+        if evt.bar_time >= (states.get(evt.bot_id) or {}).get("bar_time", 0):
+            states[evt.bot_id] = {
+                "bar_time": evt.bar_time, "received_at": self.clock.now().isoformat(),
+                "strategy_version": evt.strategy_version, "variant": d.variant,
+                "zones_bull": d.zones_bull, "zones_bear": d.zones_bear, "zones_tf": d.zones_tf,
+                "long": d.long.model_dump(), "short": d.short.model_dump(), "close": evt.close,
+            }
+            self.store.put("strategy_state", states)
+        if evt.bar_time % (60 * 60_000) == 0:  # hourly
+            self.store.prune_diagnostics(evt.bar_time - self.s.diagnostics_retention_days * 86_400_000)
+
+    def _record_entry_outcome(self, evt: EntryEvent, result: dict) -> None:
+        """Engine-side rows next to the script's own: the alert arrived, and what the engine did with it."""
+        side = 1 if evt.side == "buy" else -1
+        accepted = bool(result.get("accepted"))
+        reasons = "; ".join(result.get("reasons") or []) or result.get("status", "")
+        st = evt.setup
+        rows = [
+            (1000, {"kind": "alert_received", "dir": side, "tf": st.htf_tf, "lo": evt.stop, "hi": evt.target,
+                    "t": evt.bar_time, "msg": f"{evt.side} {evt.qty} @ {evt.price}"}),
+            (1001, {"kind": "order_accepted" if accepted else "order_rejected", "dir": side, "tf": st.htf_tf,
+                    "lo": evt.stop, "hi": evt.target, "t": evt.bar_time,
+                    "msg": (f"qty {result.get('qty')}" if accepted else reasons)[:500]}),
+        ]
+        self.store.add_diagnostics(evt.bot_id, evt.strategy_version, evt.bar_time, rows)
+
+    def diagnostics(self, limit: int = 200, kind: str | None = None, since_ms: int | None = None) -> dict:
+        return {
+            "items": self.store.recent_diagnostics(limit, kind, since_ms),
+            "counts": self.store.diagnostic_counts(since_ms),
+            "strategy_state": self.store.get("strategy_state", {}),
+        }
 
     async def handle_heartbeat(self, evt: HeartbeatEvent) -> tuple[int, dict]:
         self.store.put("tv_last_seen", self.clock.now().isoformat())
@@ -589,4 +649,5 @@ class ExecutionEngine:
                        for k, q in self.quotes.all().items()},
             "last_reconcile": self.store.get("last_reconcile"),
             "tv_last_seen": self.store.get("tv_last_seen"),
+            "strategy_state": self.store.get("strategy_state", {}),
         }

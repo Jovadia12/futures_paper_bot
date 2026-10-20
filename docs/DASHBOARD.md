@@ -8,7 +8,7 @@ A read-only monitoring website for the V25 paper bot.
 | **On your iPhone / MacBook (via Tailscale)** | `https://<pc-name>.<tailnet>.ts.net` (shown by `tailscale serve status`) |
 | **Login** | the password in `secrets\dashboard_password` |
 
-Pages: **Overview** (balance, equity, P&L, every performance metric, current position), **Activity** (live feed of signals, fills, stops, targets, rejections, halts, errors, in Eastern Time), **Trades** (searchable, filterable history, CSV export), **Analytics** (equity, cumulative P&L, daily P&L, win/loss distribution, drawdown, by weekday, by symbol; Today/7D/30D/All), **Positions** (open positions and working orders, refreshed every 4 s), **Health** (engine, Docker, TradingView feed, market data, reconciliation, mode, risk, halts, errors).
+Pages: **Overview** (balance, equity, P&L, every performance metric, current position), **Activity** (live feed of signals, fills, stops, targets, rejections, halts, errors, in Eastern Time), **Trades** (searchable, filterable history, CSV export), **Signals** (V26 only: strategy diagnostics funnel from HTF FVG detected → tap → opposing FVG selected → inversion → entry → alert received → order accepted/rejected, the exact block/rejection reasons, current setup state per timeframe, and a timeline. An engine without V26 diagnostics shows a notice), **Analytics** (equity, cumulative P&L, daily P&L, win/loss distribution, drawdown, by weekday, by symbol; Today/7D/30D/All), **Positions** (open positions and working orders, refreshed every 4 s), **Health** (engine, Docker, TradingView feed, market data, reconciliation, mode, risk, halts, errors).
 
 ---
 
@@ -18,12 +18,13 @@ Pages: **Overview** (balance, equity, P&L, every performance metric, current pos
 Browser ──► dashboard container (127.0.0.1:8080)
               │  GET only, fixed allowlist:
               │  /health /status /admin/fills /admin/orders /admin/events /admin/audit
+              │  /admin/diagnostics
               ▼
             engine container (unchanged)  ◄── TradingView via Cloudflare (port 8000)
 ```
 
 * **Separate service.** Its own container, published on `127.0.0.1:8080` only. The engine's service definition is byte-for-byte unchanged, and Docker keeps the engine running when the dashboard is added.
-* **Read-only by construction.** The dashboard's engine client can only issue GET requests to the six paths above. Kill, resume, flatten, reconcile and quote endpoints are refused before a request is built. The dashboard's only non-GET routes are its own login and logout.
+* **Read-only by construction.** The dashboard's engine client can only issue GET requests to the seven paths above. Kill, resume, flatten, reconcile and quote endpoints are refused before a request is built. The dashboard's only non-GET routes are its own login and logout.
 * **No database access.** It never opens the engine's SQLite file. All figures come from the engine's existing read endpoints, which serve the persisted records, so history survives restarts of either container.
 * **No fabricated numbers.** Balance, equity, open and today's P&L come straight from the broker account. Trades are rebuilt from recorded broker fills. Anything that can't be computed (for example win rate before the first closed trade) shows "—". If the engine is unreachable, figures are hidden, not shown stale.
 * **Token handling.** The dashboard holds the engine's admin token (the engine requires it for `/status`). The client code can only use it for the GET paths above. The webhook token is never given to the dashboard.

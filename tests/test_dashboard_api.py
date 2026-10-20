@@ -27,9 +27,10 @@ HOOK = f"/webhook/tradingview/{WEBHOOK_TOKEN}"
 class Stack:
     """Real engine app + dashboard app, joined by an in-process transport, on one fake clock."""
 
-    def __init__(self, tmp_path, engine_up=True, **dash_kw):
+    def __init__(self, tmp_path, engine_up=True, engine_kw=None, **dash_kw):
         self.clock = FakeClock(T0)
-        self.settings = make_settings(tmp_path)
+        self.settings = make_settings(tmp_path, **(engine_kw or {}))
+        self.missing_paths: set[str] = set()  # simulate an older engine without these endpoints
         self.engine = TestClient(create_app(self.settings, clock=self.clock, start_monitor=False))
         self.engine.__enter__()
         self.engine_up = engine_up
@@ -39,6 +40,8 @@ class Stack:
             self.engine_calls.append((request.method, request.url.path))
             if not self.engine_up:
                 raise httpx.ConnectError("engine down")
+            if request.url.path in self.missing_paths:
+                return httpx.Response(404, json={"detail": "Not Found"})
             r = self.engine.request(request.method, request.url.path, params=dict(request.url.params),
                                     headers={k: v for k, v in request.headers.items() if k.lower() == "authorization"})
             return httpx.Response(r.status_code, content=r.content, headers={"content-type": "application/json"})
@@ -337,3 +340,60 @@ def test_every_referenced_static_asset_exists():
         refs |= set(re.findall(r'(?:href|src)="/static/([^"]+)"', (static / page).read_text()))
     refs |= {i["src"].removeprefix("/static/") for i in _json.loads((static / "manifest.json").read_text())["icons"]}
     assert refs and all((static / r).is_file() for r in refs), sorted(r for r in refs if not (static / r).is_file())
+
+
+# ----------------------------------------------------------------------------- V26 signals
+def _v26_stack(tmp_path):
+    return Stack(tmp_path, engine_kw={"allowed_strategy_versions": ("V26-webhook.1",),
+                                      "allowed_bot_ids": ("V26-MNQ-1",)})
+
+
+def test_signals_page_shows_pipeline_state_and_exact_reasons(tmp_path):
+    from v26_payloads import diag_item, v26_bar, v26_entry
+
+    s = _v26_stack(tmp_path)
+    try:
+        ok = v26_entry(s.clock)
+        assert s.engine.post(HOOK, json=ok).json()["accepted"]
+        items = [diag_item("htf_fvg", 1, 60, 19970.0, 19990.0, 1), diag_item("tap", 1, 60, 19970.0, 19990.0, 1),
+                 diag_item("armed", 1, 60, 19970.0, 19990.0, 1), diag_item("opp_selected", 1, 1, 20000.0, 20005.0, 1),
+                 diag_item("inversion", 1, 60, 20000.0, 20005.0, 1), diag_item("entry", 1, 60, 19994.0, 20040.0, 1)]
+        s.engine.post(HOOK, json=v26_bar(s.clock, 20001.0, 20007.0, 20000.0, 20006.0, items=items,
+                                         bar_time=ok["bar_time"], long_armed=True))
+        s.engine.post("/admin/flatten", headers=ADMIN, json={})
+        s.clock.advance(120)
+        bad = v26_entry(s.clock, target_index=0)  # 1.08R
+        assert s.engine.post(HOOK, json=bad).status_code == 422
+        s.login()
+        r = s.dash.get("/api/signals?range=all").json()
+        funnel = {x["key"]: x["count"] for x in r["funnel"]}
+        assert funnel == {"htf_fvg": 1, "tap": 1, "armed": 1, "opp_selected": 1, "inversion": 1, "entry": 1,
+                          "alert_received": 2, "order_accepted": 1, "order_rejected": 1}
+        assert any("below the 2R minimum" in x["reason"] and x["kind"] == "order_rejected" for x in r["reasons"])
+        state = r["state"][0]
+        assert state["bot_id"] == "V26-MNQ-1" and state["long"]["armed"] and state["long"]["opp_hi"] == 20005.0
+        assert {z["tf"] for z in state["zones_tf"]} == {5, 10, 15, 30, 45, 60, 120, 240}
+        assert {i["source"] for i in r["timeline"]} == {"engine", "TradingView"}
+        assert {p for _, p in s.engine_calls} <= READ_ONLY_PATHS
+        assert s.dash.get("/api/signals?range=bogus").status_code == 422
+    finally:
+        s.close()
+
+
+def test_signals_page_on_engine_without_diagnostics(stack):
+    stack.missing_paths.add("/admin/diagnostics")
+    stack.login()
+    r = stack.dash.get("/api/signals").json()
+    assert r["available"] is False and "V26" in r["reason"]
+    assert stack.dash.get("/api/overview").status_code == 200  # rest of the dashboard unaffected
+
+
+def test_signals_require_login_and_report_engine_down(tmp_path):
+    s = Stack(tmp_path)
+    try:
+        assert s.dash.get("/api/signals").status_code == 401
+        s.login()
+        s.engine_up = False
+        assert s.dash.get("/api/signals").status_code == 503
+    finally:
+        s.close()

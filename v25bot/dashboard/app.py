@@ -30,7 +30,7 @@ from ..contracts import ContractError, spec_for_contract_name
 from ..logging_setup import install_redacting_record_factory, log, register_secret
 from . import analytics as an
 from .config import DashboardSettings
-from .engine_client import EngineUnavailable, ReadOnlyEngineClient
+from .engine_client import EngineEndpointMissing, EngineUnavailable, ReadOnlyEngineClient
 
 logger = logging.getLogger("v25bot.dashboard")
 STATIC = Path(__file__).parent / "static"
@@ -444,6 +444,19 @@ def create_dashboard_app(settings: DashboardSettings | None = None, *, engine_se
         except EngineUnavailable as exc:
             raise HTTPException(503, str(exc)) from None
         return {"items": an.activity(events, fills, audit, limit=max(1, min(limit, 1000)))}
+
+    @app.get("/api/signals")
+    async def signals_view(request: Request, range: str = "today") -> dict:
+        require_session(request)
+        now = clock.now()
+        since = an.range_start(check_range(range), now)
+        try:
+            diag = await client.diagnostics(int(since.timestamp() * 1000) if since else None)
+        except EngineEndpointMissing:
+            return {"available": False, "reason": "This engine version has no strategy diagnostics (V26 engines only)."}
+        except EngineUnavailable as exc:
+            raise HTTPException(503, str(exc)) from None
+        return an.signals(diag, now)
 
     return app
 

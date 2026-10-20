@@ -299,6 +299,11 @@ def create_app(settings: Settings | None = None, *, clock: Clock | None = None,
     async def fills(trading_day: str | None = None) -> list[dict]:
         return store.fills(trading_day)
 
+    @app.get("/admin/diagnostics", dependencies=admin)
+    async def diagnostics(limit: int = 200, kind: str | None = None, since: int | None = None) -> dict:
+        """V26 strategy diagnostics: the script's per-bar record plus the engine's outcome for each entry."""
+        return engine.diagnostics(min(max(limit, 1), 2000), kind, since)
+
     @app.get("/admin/audit", dependencies=admin)
     async def audit(limit: int = 100) -> list[dict]:
         return store.recent_audit(min(max(limit, 1), 1000))
